@@ -16,8 +16,15 @@ Works with any AppID that has Community Market items — CS2, Dota 2, TF2 and mo
 > [!NOTE]
 > This is **v0.2.0**. The repository can build a Windows executable (including a single-file exe), but **no signed, network-verified installer is published**. This is an independent community project, not affiliated with Valve / Steam, and it uses Steam's undocumented public endpoints — they may rate-limit or change shape at any time. Keep request rates conservative.
 
+## Screenshot
+
+![Steam Market Sentinel main window](assets/app.webp)
+
+On the left, the filterable watchlist; on the right, the selected item's price trend — the **lowest asking price** the app polls for and the **median sale price** imported from your browser are merged into a single line, with a note above the chart saying how many points come from each.
+
 ## Contents
 
+- [Screenshot](#screenshot)
 - [Features](#features)
 - [Install and run](#install-and-run)
 - [Usage](#usage)
