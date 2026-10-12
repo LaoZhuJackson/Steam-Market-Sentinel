@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "steam-market-sentinel"
+version = "0.2.0"
+description = "A compact Steam Community Market desktop price watcher"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{name = "Steam Market Sentinel contributors"}]
+dependencies = [
+  "PySide6>=6.7,<7",
+  "requests>=2.31,<3",
+  "keyring>=25,<27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.9,<1", "pyinstaller>=6,<7"]
+
+[project.gui-scripts]
+steam-market-sentinel = "steam_market_sentinel.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# QT_QPA_PLATFORM must be set before PySide6 is imported.
+"tests/test_ui.py" = ["E402"]

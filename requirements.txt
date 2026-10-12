@@ -1,0 +1,14 @@
+# Python 3.11.9
+
+# Runtime
+PySide6>=6.7,<7
+requests>=2.31,<3
+keyring>=25,<27
+
+# Development & Packaging
+pytest>=8,<10
+ruff>=0.9,<1
+pyinstaller>=6,<7
+
+# Install local project
+-e .
