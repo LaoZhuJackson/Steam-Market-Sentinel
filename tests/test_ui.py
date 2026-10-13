@@ -4,7 +4,12 @@ import time
 
 import pytest
 
-PySide6 = pytest.importorskip("PySide6")
+# Skip, rather than fail collection, when Qt is installed but its shared libraries
+# are missing (import PySide6 succeeds there; importing the sub-modules is what
+# dies, so importorskip("PySide6") alone would leave a collection error behind —
+# which is exactly how the Linux CI job was failing, with pytest exit code 2).
+pytest.importorskip("PySide6.QtWidgets")
+pytest.importorskip("PySide6.QtCharts")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtWidgets import (
@@ -19,8 +24,8 @@ from steam_market_sentinel.models import MarketItem
 from steam_market_sentinel.steam_api import SteamMarketClient
 from steam_market_sentinel.style import PALETTE, STYLE, apply_theme
 from steam_market_sentinel.ui import (
-    COL_CHECK, COL_LOW, COL_REMOVE, ImportHistoryDialog, MainWindow, SearchAddDialog,
-    history_snippet, point_tooltip_text,
+    COL_CHECK, COL_LOW, COL_NAME, COL_REMOVE, ImportHistoryDialog, MainWindow,
+    SearchAddDialog, history_snippet, point_tooltip_text,
 )
 
 
@@ -55,6 +60,14 @@ def no_network(monkeypatch):
     # Images are fetched with requests rather than Qt's network stack, so block that
     # entry point as well.
     monkeypatch.setattr(ui_module, "_fetch_image_bytes", explode)
+
+
+def _row_of(window, item_id: int) -> int:
+    """The list is sorted id DESC, so never assume a row number in tests."""
+    for row in range(window.table.rowCount()):
+        if window.table.item(row, COL_NAME).data(Qt.UserRole) == item_id:
+            return row
+    raise AssertionError(f"item {item_id} is not in the watchlist")
 
 
 def _window(tmp_path, db):
@@ -337,6 +350,112 @@ def test_each_row_has_a_remove_button(monkeypatch, tmp_path):
     window.close()
 
 
+def test_rule_edits_are_saved_immediately(tmp_path):
+    # The reported bug: setting a target, switching item and coming back showed it
+    # unset, because nothing was written until the (removed) Save button was pressed.
+    db = Database(tmp_path / "data.sqlite")
+    item = db.add_item(MarketItem(730, "Revolution Case", "Revolution Case"))  # no target
+    db.record_snapshot(item, "CNY", 1200, checked_at=1_700_000_000)
+    app, window = _window(tmp_path, db)
+
+    window.target_check.setChecked(True)  # no Save button involved
+    app.processEvents()
+    assert db.get_item(item, "CNY")["target_cents"] == 1200  # seeded from the price
+    assert window.target_metric.text() == "¥12.00"           # and the card updated
+
+    other = db.add_item(MarketItem(570, "Inscribed Gem", "Inscribed Gem"))
+    window.refresh_table()
+    window.table.selectRow(_row_of(window, other))
+    app.processEvents()
+    window.table.selectRow(_row_of(window, item))  # come back to it
+    app.processEvents()
+    assert window.target_check.isChecked()
+    assert window.target_edit.value() == 12.0
+    window.close()
+
+
+def test_selecting_an_item_does_not_rewrite_its_rules(tmp_path):
+    # Populating the widgets must not look like an edit: an item without a target
+    # must not silently gain one just by being selected.
+    db = Database(tmp_path / "data.sqlite")
+    first = db.add_item(MarketItem(730, "Revolution Case", "Revolution Case"), 900)
+    second = db.add_item(MarketItem(570, "Inscribed Gem", "Inscribed Gem"), None)
+    app, window = _window(tmp_path, db)
+    window.table.selectRow(1)
+    app.processEvents()
+    assert db.get_item(second, "CNY")["target_cents"] is None
+    assert db.get_item(first, "CNY")["target_cents"] == 900
+    window.close()
+
+
+def test_rename_updates_the_list_and_falls_back_when_cleared(tmp_path):
+    db = Database(tmp_path / "data.sqlite")
+    item = db.add_item(MarketItem(730, "Revolution Case", "Revolution Case"), 900)
+    app, window = _window(tmp_path, db)
+    window.name_edit.setText("革命武器箱")
+    window.name_edit.editingFinished.emit()  # pressing Enter / leaving the field
+    app.processEvents()
+    assert db.get_item(item, "CNY")["display_name"] == "革命武器箱"
+    assert window.table.item(0, COL_NAME).text() == "革命武器箱"
+
+    window.name_edit.setText("")  # clearing falls back to the market name
+    window.name_edit.editingFinished.emit()
+    app.processEvents()
+    assert db.get_item(item, "CNY")["display_name"] == "Revolution Case"
+    window.close()
+
+
+def test_thumbnails_survive_a_restart(monkeypatch, tmp_path):
+    # In-session switches already reused the memory cache; this locks the on-disk
+    # cache, so a fresh session does not re-download what it already has.
+    from PySide6.QtGui import QColor, QPixmap
+
+    seed = tmp_path / "seed.png"
+    source = QPixmap(4, 4)
+    source.fill(QColor("#67e3be"))
+    assert source.save(str(seed), "PNG")
+    png = seed.read_bytes()
+
+    host = "https://community.steamstatic.com/economy/image/z"
+    db = Database(tmp_path / "data.sqlite")
+    item = db.add_item(MarketItem(730, "Revolution Case", "Revolution Case"), 900)
+    db.set_item_image(item, host)
+    calls = []
+    monkeypatch.setattr(ui_module, "_fetch_image_bytes",
+                        lambda url: (calls.append(url), png)[1])
+
+    app, first = _window(tmp_path, db)
+    for _ in range(100):
+        app.processEvents()
+        if first._image_cache:
+            break
+        time.sleep(0.02)
+    assert calls == [host]
+    first.close()
+
+    calls.clear()
+    app2, second = _window(tmp_path, db)  # fresh window, empty memory cache
+    for _ in range(100):
+        app2.processEvents()
+        if not second.image.pixmap().isNull():
+            break
+        time.sleep(0.02)
+    assert calls == []  # served from disk
+    assert not second.image.pixmap().isNull()
+    second.close()
+
+
+def test_monitoring_failures_and_recoveries_are_announced(tmp_path):
+    worker = ui_module.MonitorWorker(tmp_path / "db.sqlite3",
+                                     Settings(auto_start=False, error_alert_enabled=False))
+    seen = []
+    worker.notice.connect(lambda subject, body: seen.append((subject, body)))
+    worker._notify("革命武器箱", "Revolution Case", RuntimeError("连接超时"))
+    worker._notify("革命武器箱", "Revolution Case", None)
+    assert "异常" in seen[0][0] and "连接超时" in seen[0][1]
+    assert "恢复" in seen[1][0]
+
+
 def test_the_import_dialog_offers_the_item_page():
     # Opening the item page belongs in the import flow: the snippet has to run there.
     QApplication.instance() or QApplication([])
@@ -357,6 +476,17 @@ def test_thumbnail_fetch_is_attempted_only_once_per_item(tmp_path):
                              "image_url": ""})
     assert len(window._thumb_tried) == 1  # not retried on every selection
     window.close()
+
+
+def test_add_dialog_can_set_a_display_name():
+    QApplication.instance() or QApplication([])
+    dialog = SearchAddDialog()
+    dialog.query.setText("https://steamcommunity.com/market/listings/730/AK-47%20%7C%20Redline")
+    dialog.name_edit.setText("红纹 AK")
+    item, _target = dialog.chosen()
+    assert item.display_name == "红纹 AK"
+    assert item.hash_name == "AK-47 | Redline"  # the market name is untouched
+    dialog.close()
 
 
 def test_add_dialog_needs_a_selection_then_accepts_a_pasted_link():

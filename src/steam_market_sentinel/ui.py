@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime
+import hashlib
 import sqlite3
 from pathlib import Path
 import webbrowser
@@ -218,6 +219,12 @@ class SearchAddDialog(QDialog):
         pick_layout.addWidget(caption)
         pick_layout.addWidget(self.picked_name)
         pick_layout.addWidget(self.picked_meta)
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("显示名称"))
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("留空则用市场名称（可填中文）")
+        name_row.addWidget(self.name_edit, 1)
+        pick_layout.addLayout(name_row)
         price_row = QHBoxLayout()
         self.target_enabled = QCheckBox("启用目标价格")
         self.target = QDoubleSpinBox()
@@ -324,8 +331,13 @@ class SearchAddDialog(QDialog):
     def chosen(self) -> tuple[MarketItem, int | None]:
         if self.selected_item is None:
             raise ValueError("请先搜索并选择一件商品，或粘贴 Steam 商品链接")
+        item = self.selected_item
+        name = self.name_edit.text().strip()
+        if name and name != item.display_name:
+            # Only the local display name: hash_name is what Steam is queried with.
+            item = replace(item, display_name=name)
         target = from_amount(self.target.value()) if self.target_enabled.isChecked() else None
-        return self.selected_item, target
+        return item, target
 
     def accept(self):
         if self.task and self.task.isRunning():
@@ -378,6 +390,10 @@ class SettingsDialog(QDialog):
         self.drop_alert.setChecked(original.drop_alert_enabled)
         self.drop_alert.setToolTip("只要这一轮的最低价低于上一轮（本地采样）就提醒；"
                                    "不受史低影响，因此导入历史后仍然有效")
+        self.error_alert = QCheckBox("监控异常时提醒")
+        self.error_alert.setChecked(original.error_alert_enabled)
+        self.error_alert.setToolTip("某件商品抓取失败（通常是无法访问 Steam 市场）时提醒一次，"
+                                    "恢复后再提醒一次；失败期间会自动加快重试")
         gf.addRow("报价币种", self.currency)
         gf.addRow("每轮检查间隔", self.interval)
         gf.addRow("每件商品请求间隔", self.gap)
@@ -385,6 +401,7 @@ class SettingsDialog(QDialog):
         gf.addRow(self.tray_checkbox)
         gf.addRow(self.desktop)
         gf.addRow(self.drop_alert)
+        gf.addRow(self.error_alert)
         general_note = QLabel("建议轮询间隔 ≥ 15 分钟，避免 Steam 限流。\n"
                               "切换币种会分开保存趋势与史低，目标价格需按新币种重新调整。")
         general_note.setWordWrap(True)
@@ -467,6 +484,7 @@ class SettingsDialog(QDialog):
             minimize_to_tray=self.tray_checkbox.isChecked(),
             desktop_enabled=self.desktop.isChecked(),
             drop_alert_enabled=self.drop_alert.isChecked(),
+            error_alert_enabled=self.error_alert.isChecked(),
             email_enabled=self.email_enabled.isChecked(),
             email_sender=self.sender.text().strip(),
             email_receiver=self.receiver.text().strip(),
@@ -618,6 +636,13 @@ class MainWindow(QMainWindow):
         self._thumb_tried: set[int] = set()
         self._checked: set[int] = set()  # ticked rows; exports use this
         self._image_tasks: list[BackgroundCall] = []
+        self._image_failed: set[str] = set()  # URLs not worth requesting again
+        self._decode_warned = False
+        self._loading_item = False  # guards the rule widgets while they are populated
+        self._rule_timer = QTimer(self)  # debounces the target-price spin box
+        self._rule_timer.setSingleShot(True)
+        self._rule_timer.setInterval(400)
+        self._rule_timer.timeout.connect(self.save_rule)
         self._quitting = False
         self.current_item_id: int | None = None
         self.setWindowIcon(app_icon())
@@ -742,9 +767,18 @@ class MainWindow(QMainWindow):
         self.item_game.setObjectName("subtle")
         self.item_last = QLabel("")
         self.item_last.setObjectName("subtle")
+        self.item_last.setWordWrap(True)  # the failure text is long
         name_box.addWidget(self.item_title)
         name_box.addWidget(self.item_game)
         name_box.addWidget(self.item_last)
+        rename_row = QHBoxLayout()
+        rename_row.addWidget(QLabel("显示名称"))
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("可改成中文；留空则用市场名称")
+        self.name_edit.setToolTip("只是本地显示名，不改动 Steam 上的商品名")
+        self.name_edit.editingFinished.connect(self.rename_item)
+        rename_row.addWidget(self.name_edit, 1)
+        name_box.addLayout(rename_row)
         info.addLayout(name_box, 1)
         rv.addLayout(info)
         rv.addWidget(self._divider())
@@ -793,21 +827,21 @@ class MainWindow(QMainWindow):
         self.target_edit.setDecimals(2)
         self.target_edit.setPrefix(f"{CURRENCIES[self.settings.currency][2]} ")
         self.target_edit.setEnabled(False)
-        self.target_check.toggled.connect(self.target_edit.setEnabled)
+        self.target_check.toggled.connect(self.on_target_toggled)
+        self.target_edit.valueChanged.connect(self.schedule_rule_save)
         self.low_check = QCheckBox("刷新史低时提醒")
+        self.low_check.toggled.connect(self.on_rule_toggled)
         self.enabled_check = QCheckBox("启用此商品监控")
+        self.enabled_check.toggled.connect(self.on_rule_toggled)
         f.addWidget(self.target_check, 0, 0)
         f.addWidget(self.target_edit, 0, 1)
         f.addWidget(self.low_check, 1, 0, 1, 2)
         f.addWidget(self.enabled_check, 2, 0, 1, 2)
         rules_layout.addLayout(f)
+        saved_hint = QLabel("改动会立即保存，切换商品不会丢失")
+        saved_hint.setObjectName("subtle")
+        rules_layout.addWidget(saved_hint)
         rv.addWidget(rules)
-        item_actions = QHBoxLayout()
-        save = button("保存规则", primary=True)
-        save.clicked.connect(self.save_rule)
-        item_actions.addWidget(save)
-        item_actions.addStretch()
-        rv.addLayout(item_actions)
         # The detail panel needs more vertical room than a short window can give
         # (the chart alone has a real minimum), so scroll it rather than letting
         # Qt squeeze or clip the widgets — which is what previously made the chart
@@ -1042,14 +1076,25 @@ class MainWindow(QMainWindow):
         timeline = "最后检查：" + (self._stamp(checked) if checked is not None else "尚未成功获取")
         if last is not None and last != checked:
             timeline += f"　·　最后采样：{self._stamp(last)}"
+        if item.get("last_error"):
+            # Say why it is 异常 and that it will retry by itself — otherwise the
+            # state looks stuck until the user presses 立即刷新.
+            timeline += f"　·　上次失败：{item['last_error'][:80]}（会自动重试）"
         self.item_last.setText(timeline)
         self.price_metric.setText(cents_text(item["current_cents"], self.settings.currency))
         self.low_metric.setText(cents_text(item["low_cents"], self.settings.currency))
         self.target_metric.setText(cents_text(item["target_cents"], self.settings.currency))
-        self.target_check.setChecked(item["target_cents"] is not None)
-        self.target_edit.setValue((item["target_cents"] or 0) / 100)
-        self.low_check.setChecked(bool(item["new_low_enabled"]))
-        self.enabled_check.setChecked(bool(item["enabled"]))
+        # Populating the widgets must not look like an edit and trigger a save.
+        self._loading_item = True
+        try:
+            self.target_check.setChecked(item["target_cents"] is not None)
+            self.target_edit.setEnabled(item["target_cents"] is not None)
+            self.target_edit.setValue((item["target_cents"] or 0) / 100)
+            self.low_check.setChecked(bool(item["new_low_enabled"]))
+            self.enabled_check.setChecked(bool(item["enabled"]))
+            self.name_edit.setText(item["display_name"])
+        finally:
+            self._loading_item = False
         if changed:
             self._load_image(item.get("image_url") or "", item_id)
             self.settings.selected_item = item_id
@@ -1079,7 +1124,7 @@ class MainWindow(QMainWindow):
         if self.current_item_id == item_id:
             self._load_image(url, item_id)
 
-    def _run_image_task(self, callback, on_success):
+    def _run_image_task(self, callback, on_success, on_error=None):
         """Run an image fetch off the GUI thread.
 
         Images deliberately do **not** go through Qt's network stack: this process
@@ -1094,32 +1139,62 @@ class MainWindow(QMainWindow):
         self._image_tasks = [task for task in self._image_tasks if not task.isFinished()]
         task = BackgroundCall(callback)
         task.succeeded.connect(on_success)
-        task.failed.connect(lambda _error: None)  # a missing image is not an error
+        task.failed.connect(on_error or (lambda _error: None))
         self._image_tasks.append(task)
         task.start()
+
+    def _thumb_cache_path(self, address: str) -> Path:
+        digest = hashlib.sha1(address.encode("utf-8")).hexdigest()
+        return self.db.path.parent / "thumbs" / f"{digest}.png"
+
+    def _read_thumb_from_disk(self, address: str) -> QPixmap | None:
+        path = self._thumb_cache_path(address)
+        if not path.exists():
+            return None
+        pix = QPixmap(str(path))
+        return None if pix.isNull() else pix
 
     def _load_image(self, address: str, item_id: int):
         self.image.setPixmap(QPixmap())
         self.image.setText("📦")
         cached = self._image_cache.get(address)
-        if cached is not None:
+        if cached is None and address not in self._image_failed:
+            # Thumbnails persist next to the database, so a known item never
+            # re-downloads — not even in a fresh session.
+            cached = self._read_thumb_from_disk(address)
+        if cached is not None and not cached.isNull():
+            self._image_cache[address] = cached
             self.image.setPixmap(cached)
             self.image.setText("")
             return
         parsed = QUrl(address)
         if not address or parsed.scheme() != "https" or not parsed.host().endswith(".steamstatic.com"):
             return
-        self._run_image_task(lambda: _fetch_image_bytes(address),
-                             lambda data: self.on_image_bytes(address, item_id, data))
+        if address in self._image_failed:  # do not hammer a URL that already failed
+            return
+        self._run_image_task(
+            lambda: _fetch_image_bytes(address),
+            lambda data: self.on_image_bytes(address, item_id, data),
+            lambda _error: self._image_failed.add(address))
 
     def on_image_bytes(self, address: str, item_id: int, data: bytes):
         pix = QPixmap()
         if not data or not pix.loadFromData(data):
+            if not self._decode_warned:
+                self._decode_warned = True
+                self.log("有商品图片无法解码（可能缺少该图片格式的支持），已跳过")
+                self._image_failed.add(address)
             return
         scaled = pix.scaled(84, 84, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         if len(self._image_cache) > 256:  # keep the cache bounded
             self._image_cache.clear()
         self._image_cache[address] = scaled
+        try:
+            path = self._thumb_cache_path(address)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            scaled.save(str(path), "PNG")
+        except OSError:
+            pass  # a cache write failing must never matter
         if self.current_item_id == item_id:
             self.image.setPixmap(scaled)
             self.image.setText("")
@@ -1284,15 +1359,54 @@ class MainWindow(QMainWindow):
         self.refresh_table()
         self.log("已移除 " + name)
 
-    def save_rule(self):
-        if self.current_item_id is None:
+    def rename_item(self):
+        """Persist the local display name; clearing it falls back to the market name."""
+        if self._loading_item or self.current_item_id is None:
+            return
+        item = self.db.get_item(self.current_item_id, self.settings.currency)
+        if item is None:
+            return
+        wanted = self.name_edit.text().strip() or item["hash_name"]
+        if wanted == item["display_name"]:
+            return
+        self.db.set_item_display_name(self.current_item_id, wanted)
+        self.refresh_table()
+        self.log("已重命名为：" + wanted)
+
+    def on_target_toggled(self, checked: bool):
+        """Ticking 目标价提醒 must save straight away — there is no Save button."""
+        self.target_edit.setEnabled(checked)
+        if checked and self.target_edit.value() == 0 and self.current_item_id is not None:
+            item = self.db.get_item(self.current_item_id, self.settings.currency)
+            # A target of 0 can never fire, so start from the price being watched.
+            if item and item["current_cents"]:
+                self.target_edit.blockSignals(True)
+                self.target_edit.setValue(item["current_cents"] / 100)
+                self.target_edit.blockSignals(False)
+        self.save_rule(refresh=True)
+
+    def on_rule_toggled(self, _checked: bool):
+        self.save_rule(refresh=True)
+
+    def schedule_rule_save(self, _value: float):
+        """Debounce the spin box: typing a price should not write on every keystroke."""
+        if not self._loading_item:
+            self._rule_timer.start()
+
+    def save_rule(self, refresh: bool = False):
+        """Persist the rule widgets immediately.
+
+        The panel has no Save button: edits used to be lost the moment you switched
+        to another item, which read as "the target price does not persist".
+        """
+        if self._loading_item or self.current_item_id is None:
             return
         target = from_amount(self.target_edit.value()) if self.target_check.isChecked() else None
         self.db.update_item(self.current_item_id, target, self.low_check.isChecked(),
                             self.enabled_check.isChecked())
-        self.refresh_table()
-        self.log("监控规则已保存；目标价按当前选择币种填写")
-        if self.worker and self.worker.isRunning():
+        self.refresh_table()  # also refreshes the 目标价格 card and the 目标 column
+        self.log("规则已保存；目标价按当前选择币种填写" if target is not None else "规则已保存")
+        if refresh and self.worker and self.worker.isRunning():
             self.worker.refresh_now()
 
     def start_monitor(self):
@@ -1301,6 +1415,7 @@ class MainWindow(QMainWindow):
         self.worker = MonitorWorker(self.db.path, replace(self.settings))
         self.worker.updated.connect(self.schedule_refresh)
         self.worker.alert_found.connect(self.notify_alert)
+        self.worker.notice.connect(self.on_notice)
         self.worker.message.connect(self.log)
         self.worker.cycle_complete.connect(self.flush_refresh)
         self.worker.finished.connect(self.on_worker_finished)
@@ -1327,6 +1442,16 @@ class MainWindow(QMainWindow):
             self.log("本轮结束后将立即再次刷新")
         else:
             self.start_monitor()
+
+    def on_notice(self, subject: str, body: str):
+        """Monitoring failures and recoveries: status bar plus a tray popup."""
+        self.log(subject)
+        if self.settings.desktop_enabled:
+            if self.tray and self.tray.supportsMessages():
+                self.tray.showMessage(subject, body.splitlines()[0],
+                                      QSystemTrayIcon.Information, 15000)
+            else:
+                self.log(subject + "（当前系统不支持托盘弹窗）")
 
     def notify_alert(self, alert: Alert):
         subject, body = render_alert(alert)

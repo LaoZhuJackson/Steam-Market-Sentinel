@@ -31,6 +31,9 @@ class Settings:
     # is independent of the observed-low baseline, so an imported official history
     # (which can lower that baseline out of reach) cannot switch it off.
     drop_alert_enabled: bool = False
+    # Notify when an item starts failing (usually the network cannot reach Steam)
+    # and again when it recovers. Transition-based, so an outage alerts once.
+    error_alert_enabled: bool = True
     email_enabled: bool = False
     email_sender: str = ""
     email_receiver: str = ""

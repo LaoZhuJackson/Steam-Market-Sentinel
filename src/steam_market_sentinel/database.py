@@ -172,6 +172,11 @@ class Database:
         with self.connection() as db:
             db.execute("DELETE FROM items WHERE id=?", (item_id,))
 
+    def set_item_display_name(self, item_id: int, name: str) -> None:
+        """Rename how an item is shown locally; ``hash_name`` is never touched."""
+        with self.connection() as db:
+            db.execute("UPDATE items SET display_name=? WHERE id=?", (name, item_id))
+
     def set_item_image(self, item_id: int, url: str) -> None:
         """Store a thumbnail URL fetched after the item was added.
 

@@ -108,6 +108,14 @@ def _onebot_send(settings: Settings, subject: str, body: str) -> None:
 def send_remote_notifications(settings: Settings, alert: Alert) -> list[str]:
     """Best effort delivery, errors returned to UI; never log secret values."""
     subject, body = render_alert(alert)
+    return send_text_notifications(settings, subject, body)
+
+
+def send_text_notifications(settings: Settings, subject: str, body: str) -> list[str]:
+    """Same channels as the price alerts, for messages that are not prices.
+
+    Used for monitoring failures and recoveries, which carry no amount.
+    """
     errors = []
     for enabled, name, handler in (
         (settings.email_enabled, "QQ 邮箱", _smtp_send),

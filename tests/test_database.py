@@ -185,6 +185,25 @@ def test_official_history_reimport_replaces_wholesale(tmp_path):
     assert db.merged_point_counts(item, "CNY") == (1, 2)  # still exactly two
 
 
+def test_a_successful_poll_clears_the_error(tmp_path):
+    # Otherwise the watchlist stays 异常 after the network comes back.
+    db = Database(tmp_path / "db.sqlite")
+    item = sample(db)
+    db.set_error(item, "Steam 请求失败: 连接超时")
+    assert db.get_item(item, "CNY")["last_error"] == "Steam 请求失败: 连接超时"
+    db.record_snapshot(item, "CNY", 1000, checked_at=1)
+    assert db.get_item(item, "CNY")["last_error"] is None
+
+
+def test_rename_keeps_the_market_name(tmp_path):
+    db = Database(tmp_path / "db.sqlite")
+    item = sample(db)
+    db.set_item_display_name(item, "革命武器箱")
+    row = db.get_item(item, "CNY")
+    assert row["display_name"] == "革命武器箱"
+    assert row["hash_name"] == "Revolution Case"  # still what Steam is queried with
+
+
 def test_set_item_image_fills_in_a_missing_thumbnail(tmp_path):
     # Items added by pasting a link arrive without an icon; the UI fetches it later.
     db = Database(tmp_path / "db.sqlite")

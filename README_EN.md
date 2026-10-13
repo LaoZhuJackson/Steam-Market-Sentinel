@@ -105,7 +105,7 @@ Click **＋ 添加商品**, then use the **single** input box in either way:
 
 Either route funnels into the same "will be added" summary card. The Add button stays disabled until a concrete item is selected, so you can no longer fill in the wrong box. You can also tick "enable target price" and set a threshold at the same time.
 
-After adding, the poller fetches prices and the right-hand panel shows the thumbnail and the local price chart. Items **added by pasting a link start without an image**; selecting one makes the app read the thumbnail from its item page once (stored locally afterwards, and a failure just leaves the placeholder rather than reporting an error).
+After adding, the poller fetches prices and the right-hand panel shows the thumbnail and the local price chart. Items **added by pasting a link start without an image**; selecting one makes the app read the thumbnail from its item page once (a failure just leaves the placeholder rather than reporting an error). Thumbnails are **cached on disk** (in `thumbs/` under the data directory), so switching items — or restarting the app — never re-downloads them.
 
 ### Monitoring and alert rules
 
@@ -117,7 +117,11 @@ Select an item in the watchlist to edit its rules on the right:
 | Alert on a new all-time low | Notifies when the price strictly beats the previous all-time low. **The first sample only establishes a baseline and does not alert.** |
 | Enable monitoring for this item | Unchecking pauses polling; the existing local history is kept. |
 
-The panel's bottom row now only has **Save rule**; **Remove** moved into the watchlist — each row ends with a **×** that removes that item (deleting its local history too, so export first; the confirmation names the item).
+Rule edits **save immediately** — there is no Save rule button, because editing a target and then switching items used to lose it. Ticking a rule or typing a price now takes effect at once and the **target price** figure updates with it. Ticking "target price alert" while the value is still 0 seeds it from the current price (a target of 0 can never fire).
+
+You can also edit the **display name**: Chinese is fine, it only affects the local label and **never changes the item name on Steam**; clearing it falls back to the market name.
+
+**Remove** moved into the watchlist — each row ends with a **×** that removes that item (deleting its local history too, so export first; the confirmation names the item).
 
 Open the item page with **View on Steam** inside the "导入官方历史…" dialog — the import flow requires opening that page in your browser anyway, so it belongs to the same step.
 
@@ -203,9 +207,12 @@ Tray + QQ Mail is the recommended combination.
 | Minimize to tray on close | On | The process only exits via "Quit" in the tray menu |
 | Show desktop tray notifications | On | Needs a desktop environment with notification support |
 | Notify when the price drops | **Off** | Notifies whenever this cycle's lowest price is below the **previous local sample**. It compares against local samples, so it keeps working after an official history is imported (see the price-definitions notes) |
+| Notify on monitoring failures | **On** | Notifies once when an item starts failing (usually the network cannot reach Steam) and once when it recovers; while it is failing the poller **retries sooner** instead of buzzing you every cycle |
 | QQ Mail / QQ Bot | Off | Requires you to configure a code or a compatible bot service |
 
 **Batch monitoring is not a real-time feed**: watching 100 items with a 6-second gap means one cycle alone takes at least ~10 minutes before network and rate-limit time. The cycle interval is the wait **between** cycles, not a per-item refresh guarantee.
+
+**Monitoring recovers by itself**: if anything failed in a cycle, the next one comes **2 minutes** later instead of waiting the full interval — so reconnecting or switching on your proxy needs no button press. The first successful poll clears the 异常 state back to 监控中 and sends one "monitoring recovered" notice, if notifications are enabled.
 
 ## Price definitions, privacy and data
 
