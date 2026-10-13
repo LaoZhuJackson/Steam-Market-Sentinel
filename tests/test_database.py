@@ -194,6 +194,30 @@ def test_set_item_image_fills_in_a_missing_thumbnail(tmp_path):
     assert db.get_item(item, "CNY")["image_url"].endswith("/image/abc")
 
 
+def test_exports_can_be_limited_to_selected_items(tmp_path):
+    db = Database(tmp_path / "db.sqlite")
+    first = db.add_item(MarketItem(730, "Revolution Case", "Revolution Case"), 900)
+    second = db.add_item(MarketItem(570, "Inscribed Gem", "Inscribed Gem"))
+    db.record_snapshot(first, "CNY", 1000, checked_at=1)
+    db.record_snapshot(second, "CNY", 2000, checked_at=2)
+
+    one = tmp_path / "one.json"
+    assert db.export_watchlist(one, {first}) == 1
+    assert json.loads(one.read_text(encoding="utf-8"))[0]["hash_name"] == "Revolution Case"
+    # An explicit empty selection exports nothing, rather than falling back to all.
+    assert db.export_watchlist(tmp_path / "none.json", set()) == 0
+
+    csv_one = tmp_path / "one.csv"
+    db.export_history_csv(csv_one, "CNY", {second})
+    rows = csv_one.read_text(encoding="utf-8-sig").splitlines()
+    assert len(rows) == 2 and "Inscribed Gem" in rows[1]
+
+    # No filter at all still means every item.
+    csv_all = tmp_path / "all.csv"
+    db.export_history_csv(csv_all, "CNY")
+    assert len(csv_all.read_text(encoding="utf-8-sig").splitlines()) == 3
+
+
 def test_official_history_dedupes_and_cascades(tmp_path):
     db = Database(tmp_path / "db.sqlite")
     item = sample(db)

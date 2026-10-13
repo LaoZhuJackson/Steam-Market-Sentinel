@@ -43,7 +43,7 @@ On the left, the filterable watchlist; on the right, the selected item's price t
 - **Batch polling** — items are polled one by one, with separate cycle-interval and per-item spacing; rate limits and network errors back off and retry, and one failing item never aborts the cycle.
 - **Two alert rules** — ① notify once when `price <= target`, re-arming only after the price leaves the threshold; ② notify when the price strictly beats the lowest listing observed since tracking began (the first sample only establishes a baseline and does not alert).
 - **Multiple notification channels** — desktop tray popups, QQ Mail SMTP, and OneBot v11 private messages (e.g. via NapCat). They can be enabled together.
-- **Local history and export** — SQLite snapshots of the lowest sell listing; JSON watchlist import/export and UTF-8 BOM CSV history export.
+- **Local history and export** — SQLite snapshots of the lowest sell listing; JSON watchlist import/export and UTF-8 BOM CSV history export, either of which can be limited to the **ticked items**.
 - **Switchable quote currency** — CNY / USD / EUR, each kept as an independent series.
 - **Official sales history you can import and keep** — Steam's **median sale price** curve is only served to a browser session, and the app never asks for or stores credentials. So there is an "导入官方历史…" (import) action: run one line in the item page, paste the result, and it is **stored for good and merged into that item's observed curve** (one line; the two are different quantities — see "Price definitions" below).
 - **Secrets stay in the OS keyring** — the QQ Mail authorization code and OneBot access token go through `keyring`, never into `settings.json`.
@@ -117,9 +117,11 @@ Select an item in the watchlist to edit its rules on the right:
 | Alert on a new all-time low | Notifies when the price strictly beats the previous all-time low. **The first sample only establishes a baseline and does not alert.** |
 | Enable monitoring for this item | Unchecking pauses polling; the existing local history is kept. |
 
-Buttons below: **Save rule**, **Remove**. Removing also deletes that item's local history — export first if you want to keep it.
+The panel's bottom row now only has **Save rule**; **Remove** moved into the watchlist — each row ends with a **×** that removes that item (deleting its local history too, so export first; the confirmation names the item).
 
-**View on Steam** now lives inside the "导入官方历史…" dialog: the import flow requires opening that page in your browser anyway, so having it in the same step is handier.
+Open the item page with **View on Steam** inside the "导入官方历史…" dialog — the import flow requires opening that page in your browser anyway, so it belongs to the same step.
+
+Every row also has a **tick box**, next to **全选** / **清除全选** (select all / clear) above the list: **Export watchlist** and **Export history CSV** then cover **only the ticked items** (with nothing ticked they fall back to everything, and the status bar says so). Ticks survive the polling refresh.
 
 Settings additionally has a **global** switch, "**Notify when the price drops**": it notifies whenever this cycle's lowest price is below the previous local sample. It is independent of the two rules above and unaffected by the all-time low — after importing an official history it is usually more useful than "new all-time low".
 

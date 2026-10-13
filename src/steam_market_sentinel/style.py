@@ -133,6 +133,15 @@ QPushButton#primary:pressed { background: $accent_active; }
 QPushButton#primary:disabled {
     color: $text_disabled; background: $panel; border-color: $border;
 }
+/* The per-row ✕ in the watchlist: readable at rest, clearly destructive on hover. */
+QPushButton#rowRemove {
+    color: $text_muted; background: transparent; border: 1px solid transparent;
+    padding: 0; font-size: 13px; font-weight: 700;
+}
+QPushButton#rowRemove:hover {
+    color: $danger; background: $danger_surface_hover; border: 1px solid $danger_border;
+    border-radius: 6px;
+}
 QPushButton#danger {
     color: $danger; background: $danger_surface; border: 1px solid $danger_border;
 }

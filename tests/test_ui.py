@@ -6,7 +6,7 @@ import pytest
 
 PySide6 = pytest.importorskip("PySide6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-from PySide6.QtCore import QPointF
+from PySide6.QtCore import QPointF, Qt
 from PySide6.QtWidgets import (
     QApplication, QDialog, QDialogButtonBox, QMessageBox, QPushButton,
 )
@@ -19,8 +19,24 @@ from steam_market_sentinel.models import MarketItem
 from steam_market_sentinel.steam_api import SteamMarketClient
 from steam_market_sentinel.style import PALETTE, STYLE, apply_theme
 from steam_market_sentinel.ui import (
-    ImportHistoryDialog, MainWindow, SearchAddDialog, history_snippet, point_tooltip_text,
+    COL_CHECK, COL_LOW, COL_REMOVE, ImportHistoryDialog, MainWindow, SearchAddDialog,
+    history_snippet, point_tooltip_text,
 )
+
+
+def _fake_import_dialog(monkeypatch, points, label="¥…"):
+    """Stand in for ImportHistoryDialog so the import path can be driven directly."""
+    class FakeDialog:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def exec(self):
+            return QDialog.Accepted
+
+        def parsed(self):
+            return list(points), label
+
+    monkeypatch.setattr(ui_module, "ImportHistoryDialog", FakeDialog)
 
 
 @pytest.fixture(autouse=True)
@@ -195,18 +211,7 @@ def test_a_currency_mismatched_import_is_refused(monkeypatch, tmp_path):
 
     warned = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: warned.append(args))
-
-    class FakeDialog:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def exec(self):
-            return QDialog.Accepted
-
-        def parsed(self):
-            return [(1_700_000_000, 500)], "S$…"  # SGD, while the setting is CNY
-
-    monkeypatch.setattr(ui_module, "ImportHistoryDialog", FakeDialog)
+    _fake_import_dialog(monkeypatch, [(1_700_000_000, 500)], "S$…")  # SGD, setting is CNY
     window.import_official_history()
 
     assert warned                                        # the user was told why
@@ -267,6 +272,68 @@ def test_image_bytes_reach_the_label_and_the_cache(monkeypatch, tmp_path):
         time.sleep(0.02)
     assert host in window._image_cache          # fetched, decoded and cached
     assert not window.image.pixmap().isNull()   # and shown in the panel
+    window.close()
+
+
+def test_importing_history_updates_the_watchlist_low(monkeypatch, tmp_path):
+    # The reported bug: the chart changed but the watchlist kept the pre-import 史低.
+    db = Database(tmp_path / "data.sqlite")
+    db.add_item(MarketItem(730, "Revolution Case", "Revolution Case"), 900)
+    db.record_snapshot(1, "CNY", 5000, checked_at=1_700_000_000)
+    app, window = _window(tmp_path, db)
+    assert window.table.item(0, COL_LOW).text() == "¥50.00"
+
+    _fake_import_dialog(monkeypatch, [(1_699_000_000, 500)])
+    window.import_official_history()
+    app.processEvents()
+    assert window.table.item(0, COL_LOW).text() == "¥5.00"  # the merged low
+    assert "官方成交中位价" in window.chart.chart().title()
+    window.close()
+
+
+def test_tick_state_survives_a_poll_refresh(tmp_path):
+    # The list is rebuilt on every poll (twice a second while monitoring), so the
+    # ticks have to live outside the table items.
+    db = Database(tmp_path / "data.sqlite")
+    item = db.add_item(MarketItem(730, "Revolution Case", "Revolution Case"), 900)
+    app, window = _window(tmp_path, db)
+    window.table.item(0, COL_CHECK).setCheckState(Qt.Checked)
+    app.processEvents()
+    assert window._checked == {item}
+
+    window.refresh_table()
+    assert window.table.item(0, COL_CHECK).checkState() == Qt.Checked
+    assert window._checked == {item}
+    window.close()
+
+
+def test_select_all_and_clear_all(tmp_path):
+    db = Database(tmp_path / "data.sqlite")
+    first = db.add_item(MarketItem(730, "Revolution Case", "Revolution Case"), 900)
+    second = db.add_item(MarketItem(570, "Inscribed Gem", "Inscribed Gem"), None)
+    app, window = _window(tmp_path, db)
+    window.check_all_items()
+    assert window._checked == {first, second}
+    assert "已选 2" in window.count_label.text()
+
+    window.uncheck_all_items()
+    assert window._checked == set()
+    assert "已选" not in window.count_label.text()
+    window.close()
+
+
+def test_each_row_has_a_remove_button(monkeypatch, tmp_path):
+    db = Database(tmp_path / "data.sqlite")
+    item = db.add_item(MarketItem(730, "Revolution Case", "Revolution Case"), 900)
+    app, window = _window(tmp_path, db)
+    remove = window.table.cellWidget(0, COL_REMOVE)
+    assert isinstance(remove, QPushButton) and remove.text() == "×"
+
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes)
+    remove.click()
+    app.processEvents()
+    assert db.get_item(item, "CNY") is None
+    assert window.table.rowCount() == 0
     window.close()
 
 

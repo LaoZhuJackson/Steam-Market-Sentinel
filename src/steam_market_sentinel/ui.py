@@ -34,6 +34,12 @@ from .style import PALETTE
 # line at all, so it would render invisibly. Hover works either way.
 SPARSE_SERIES_MARKERS = 40
 
+# Watchlist columns: a check box, the item, its three prices, its state, and a
+# per-row remove button. Named so the many places that touch a row index cannot
+# drift apart.
+(COL_CHECK, COL_NAME, COL_PRICE, COL_TARGET, COL_LOW, COL_STATE,
+ COL_REMOVE) = range(7)
+
 STATE_COLORS = {
     "监控中": PALETTE["accent"],
     "异常": PALETTE["danger"],
@@ -610,6 +616,7 @@ class MainWindow(QMainWindow):
         self._image_cache: dict[str, QPixmap] = {}
         self._chart_key: tuple | None = None
         self._thumb_tried: set[int] = set()
+        self._checked: set[int] = set()  # ticked rows; exports use this
         self._image_tasks: list[BackgroundCall] = []
         self._quitting = False
         self.current_item_id: int | None = None
@@ -671,15 +678,29 @@ class MainWindow(QMainWindow):
         add.clicked.connect(self.add_item)
         top.addWidget(add)
         lv.addLayout(top)
+        filters = QHBoxLayout()
         self.filter_text = QLineEdit()
         self.filter_text.setPlaceholderText("筛选监控清单…")
         self.filter_text.textChanged.connect(self.filter_rows)
-        lv.addWidget(self.filter_text)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["商品", "现价", "目标", "史低", "状态"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        for column in (1, 2, 3, 4):
-            self.table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        self.select_all_btn = button("全选")
+        self.select_all_btn.setToolTip("勾选当前显示的商品；导出只包含勾选项")
+        self.select_all_btn.clicked.connect(self.check_all_items)
+        self.clear_all_btn = button("清除全选")
+        self.clear_all_btn.setToolTip("取消所有勾选，此后导出为全部商品")
+        self.clear_all_btn.clicked.connect(self.uncheck_all_items)
+        filters.addWidget(self.filter_text, 1)
+        filters.addWidget(self.select_all_btn)
+        filters.addWidget(self.clear_all_btn)
+        lv.addLayout(filters)
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["", "商品", "现价", "目标", "史低", "状态", ""])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(COL_NAME, QHeaderView.Stretch)
+        for column in (COL_PRICE, COL_TARGET, COL_LOW, COL_STATE):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        for column, width in ((COL_CHECK, 30), (COL_REMOVE, 34)):
+            header.setSectionResizeMode(column, QHeaderView.Fixed)
+            self.table.setColumnWidth(column, width)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -687,6 +708,7 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(30)
         self.table.itemSelectionChanged.connect(self.on_selection_changed)
+        self.table.itemChanged.connect(self.on_table_item_changed)
         lv.addWidget(self.table, 1)
         actions = QHBoxLayout()
         import_btn = button("导入清单")
@@ -783,12 +805,8 @@ class MainWindow(QMainWindow):
         item_actions = QHBoxLayout()
         save = button("保存规则", primary=True)
         save.clicked.connect(self.save_rule)
-        delete = button("移除")
-        delete.setObjectName("danger")
-        delete.clicked.connect(self.remove_item)
         item_actions.addWidget(save)
         item_actions.addStretch()
-        item_actions.addWidget(delete)
         rv.addLayout(item_actions)
         # The detail panel needs more vertical room than a short window can give
         # (the chart alone has a real minimum), so scroll it rather than letting
@@ -882,21 +900,26 @@ class MainWindow(QMainWindow):
         for r, item in enumerate(records):
             state = "暂停" if not item["enabled"] else (
                 "异常" if item["last_error"] else ("监控中" if item["current_cents"] is not None else "待检测"))
-            columns = (item["display_name"], cents_text(item["current_cents"], self.settings.currency),
-                       cents_text(item["target_cents"], self.settings.currency),
-                       cents_text(item["low_cents"], self.settings.currency), state)
-            for c, value in enumerate(columns):
+            self.table.setItem(r, COL_CHECK, self._check_cell(item["id"]))
+            values = (item["display_name"],
+                      cents_text(item["current_cents"], self.settings.currency),
+                      cents_text(item["target_cents"], self.settings.currency),
+                      cents_text(item["low_cents"], self.settings.currency),
+                      state)
+            for offset, value in enumerate(values):
+                column = COL_NAME + offset
                 cell = QTableWidgetItem(value)
-                if c in (1, 2, 3):
+                if column in (COL_PRICE, COL_TARGET, COL_LOW):
                     cell.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if c == 0:
+                if column == COL_NAME:
                     cell.setData(Qt.UserRole, item["id"])
                     cell.setToolTip(f"{item['appid']} · {item['hash_name']}")
-                if c == 4:
+                if column == COL_STATE:
                     cell.setForeground(QColor(STATE_COLORS.get(state, PALETTE["text_muted"])))
                     if state == "异常":
                         cell.setToolTip(item["last_error"] or "")
-                self.table.setItem(r, c, cell)
+                self.table.setItem(r, column, cell)
+            self.table.setCellWidget(r, COL_REMOVE, self._remove_button(item["id"]))
             if item["id"] == keep:
                 keep_row = r
         if keep_row is None and records:
@@ -919,10 +942,69 @@ class MainWindow(QMainWindow):
         self.table.setUpdatesEnabled(True)
         self.table.verticalScrollBar().setValue(scroll)
         self.table.blockSignals(False)
-        self.count_label.setText(f"{len(records)} 件")
+        checked = f" · 已选 {len(self._checked)}" if self._checked else ""
+        self.count_label.setText(f"{len(records)} 件{checked}")
         self.filter_rows()
         if keep_row is not None:
             self.on_selection_changed()
+
+    def _check_cell(self, item_id: int) -> QTableWidgetItem:
+        cell = QTableWidgetItem("")
+        cell.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
+        cell.setCheckState(Qt.Checked if item_id in self._checked else Qt.Unchecked)
+        cell.setData(Qt.UserRole, item_id)
+        cell.setTextAlignment(Qt.AlignCenter)
+        return cell
+
+    def _remove_button(self, item_id: int) -> QPushButton:
+        remove = QPushButton("×")  # U+00D7: present in every font, unlike ✕
+        remove.setObjectName("rowRemove")
+        remove.setToolTip("移除该商品（连同它的本地历史）")
+        remove.clicked.connect(lambda _checked=False, target=item_id: self.remove_item(target))
+        return remove
+
+    def on_table_item_changed(self, cell: QTableWidgetItem):
+        """Track the tick boxes. Rebuilds are signal-blocked, so this is only the user."""
+        if cell.column() != COL_CHECK:
+            return
+        item_id = cell.data(Qt.UserRole)
+        if item_id is None:
+            return
+        if cell.checkState() == Qt.Checked:
+            self._checked.add(int(item_id))
+        else:
+            self._checked.discard(int(item_id))
+        self._update_checked_label()
+
+    def _update_checked_label(self):
+        total = self.table.rowCount()
+        checked = f" · 已选 {len(self._checked)}" if self._checked else ""
+        self.count_label.setText(f"{total} 件{checked}")
+
+    def check_all_items(self):
+        for row in range(self.table.rowCount()):
+            cell = self.table.item(row, COL_CHECK)
+            if cell is not None and not self.table.isRowHidden(row):
+                item_id = cell.data(Qt.UserRole)
+                if item_id is not None:
+                    self._checked.add(int(item_id))
+        self._sync_check_boxes()
+
+    def uncheck_all_items(self):
+        self._checked.clear()
+        self._sync_check_boxes()
+
+    def _sync_check_boxes(self):
+        self.table.blockSignals(True)
+        for row in range(self.table.rowCount()):
+            cell = self.table.item(row, COL_CHECK)
+            if cell is not None:
+                item_id = cell.data(Qt.UserRole)
+                wanted = Qt.Checked if item_id in self._checked else Qt.Unchecked
+                if cell.checkState() != wanted:
+                    cell.setCheckState(wanted)
+        self.table.blockSignals(False)
+        self._update_checked_label()
 
     def schedule_refresh(self, item_id: int, currency: str):
         if currency != self.settings.currency:
@@ -939,7 +1021,7 @@ class MainWindow(QMainWindow):
         row = self.table.currentRow()
         if row < 0:
             return
-        cell = self.table.item(row, 0)
+        cell = self.table.item(row, COL_NAME)
         if cell is None:
             return
         item_id = cell.data(Qt.UserRole)
@@ -1163,9 +1245,11 @@ class MainWindow(QMainWindow):
         except (ValueError, sqlite3.IntegrityError) as exc:
             QMessageBox.warning(self, "导入失败", str(exc))
             return
-        # The imported points are part of the observed line now, so just redraw it.
+        # Rebuild the list, not just the chart: 史低 is the minimum of local *and*
+        # imported samples, so it changes at import time too — and until this ran,
+        # the watchlist kept showing the pre-import value.
         self._chart_key = None
-        self.refresh_chart()
+        self.refresh_table()
         self.log(f"已导入 {count} 个官方成交历史数据点，已并入观测序列：{item['display_name']}")
 
     def add_item(self):
@@ -1186,14 +1270,19 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.refresh_now()
 
-    def remove_item(self):
-        if self.current_item_id is None:
+    def remove_item(self, item_id: int):
+        """Remove one item and its local history. Called by that row's ✕ button."""
+        item = self.db.get_item(item_id, self.settings.currency)
+        name = item["display_name"] if item else f"#{item_id}"
+        if QMessageBox.question(self, "移除商品",
+                                f"移除「{name}」及其全部本地历史记录？") != QMessageBox.Yes:
             return
-        if QMessageBox.question(self, "移除商品", "移除该商品及其全部本地历史记录？") != QMessageBox.Yes:
-            return
-        self.db.delete_item(self.current_item_id)
-        self.current_item_id = None
+        self.db.delete_item(item_id)
+        self._checked.discard(item_id)
+        if self.current_item_id == item_id:
+            self.current_item_id = None
         self.refresh_table()
+        self.log("已移除 " + name)
 
     def save_rule(self):
         if self.current_item_id is None:
@@ -1281,23 +1370,35 @@ class MainWindow(QMainWindow):
         except (ValueError, OSError, TypeError) as exc:
             QMessageBox.warning(self, "导入失败", str(exc))
 
+    def _export_ids(self) -> set[int] | None:
+        """What the exports cover: the ticked items, or everything if none are ticked."""
+        return set(self._checked) or None
+
     def export_watchlist(self):
         filename, _ = QFileDialog.getSaveFileName(self, "导出监控清单", "watchlist.json", "JSON (*.json)")
-        if filename:
-            try:
-                count = self.db.export_watchlist(Path(filename))
-                self.log(f"已导出 {count} 件监控商品（不含凭据）")
-            except OSError as exc:
-                QMessageBox.warning(self, "导出失败", str(exc))
+        if not filename:
+            return
+        ids = self._export_ids()
+        try:
+            count = self.db.export_watchlist(Path(filename), ids)
+        except OSError as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        scope = f"其中勾选 {count} 件" if ids else "未勾选任何商品，已导出全部"
+        self.log(f"已导出监控清单（{scope}，不含凭据）")
 
     def export_history(self):
         filename, _ = QFileDialog.getSaveFileName(self, "导出历史数据", "prices.csv", "CSV (*.csv)")
-        if filename:
-            try:
-                self.db.export_history_csv(Path(filename), self.settings.currency)
-                self.log("CSV 已保存（只包含当前币种的最低挂单采样）")
-            except OSError as exc:
-                QMessageBox.warning(self, "导出失败", str(exc))
+        if not filename:
+            return
+        ids = self._export_ids()
+        try:
+            self.db.export_history_csv(Path(filename), self.settings.currency, ids)
+        except OSError as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        scope = "已勾选的商品" if ids else "全部商品"
+        self.log(f"CSV 已保存：{scope}、当前币种（source 列区分本地采样与官方成交中位价）")
 
     def closeEvent(self, event):
         if not self._quitting and self.settings.minimize_to_tray and self.tray:

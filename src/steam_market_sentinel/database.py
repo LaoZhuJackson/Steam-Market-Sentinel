@@ -335,35 +335,61 @@ class Database:
                 (item_id, currency)).fetchone()[0]
         return int(local), int(imported)
 
-    def export_history_csv(self, path: Path, currency: str) -> None:
-        """Export the merged series.
+    def export_history_csv(self, path: Path, currency: str,
+                           item_ids: set[int] | None = None) -> None:
+        """Export the merged series, optionally only for the given items.
 
         A ``source`` column distinguishes rows the poller observed from imported
         official points, which are a different quantity even though they share the
-        chart — without it the export would silently mix the two.
+        chart — without it the export would silently mix the two. ``item_ids=None``
+        means every item; an empty set exports only the header.
         """
+        # Both branches of the UNION are filtered the same way; their parameters must
+        # stay in the SQL's own order (currency, then ids, per branch).
+        local_where, official_where = "s.currency=?", "o.currency=?"
+        local_params: list = [currency]
+        official_params: list = [currency]
+        if item_ids is not None:
+            if not item_ids:  # explicitly nothing selected: header only
+                path.write_text("", encoding="utf-8-sig")
+                return
+            placeholders = ",".join(["?"] * len(item_ids))
+            local_where += f" AND s.item_id IN ({placeholders})"
+            official_where += f" AND o.item_id IN ({placeholders})"
+            local_params += list(item_ids)
+            official_params += list(item_ids)
         with self.connection() as db, path.open("w", newline="", encoding="utf-8-sig") as dest:
             writer = csv.writer(dest)
             writer.writerow(["appid", "market_hash_name", "currency", "utc_timestamp",
                              "lowest_listing_price", "volume", "source"])
-            for row in db.execute("""
+            for row in db.execute(f"""
                     SELECT i.appid, i.hash_name, s.currency, s.recorded_at, s.price_cents,
                            s.volume, 'local'
                       FROM snapshots s JOIN items i ON i.id=s.item_id
-                     WHERE s.currency=?
+                     WHERE {local_where}
                     UNION ALL
                     SELECT i.appid, i.hash_name, o.currency, o.recorded_at, o.price_cents,
                            NULL, 'official'
                       FROM official_prices o JOIN items i ON i.id=o.item_id
-                     WHERE o.currency=?
-                     ORDER BY 4""", (currency, currency)):
+                     WHERE {official_where}
+                     ORDER BY 4""", local_params + official_params):
                 writer.writerow([row[0], row[1], row[2], row[3], f"{row[4]/100:.2f}",
                                  row[5], row[6]])
 
-    def export_watchlist(self, path: Path) -> int:
+    def export_watchlist(self, path: Path, item_ids: set[int] | None = None) -> int:
+        """Export the watchlist, optionally only for the given items."""
+        sql = """SELECT appid,hash_name,display_name,app_name,image_url,
+                 target_cents,new_low_enabled,enabled FROM items"""
+        params: tuple = ()
+        if item_ids is not None:
+            if not item_ids:  # explicitly nothing selected
+                path.write_text("[]", encoding="utf-8")
+                return 0
+            sql += f" WHERE id IN ({','.join('?' * len(item_ids))})"
+            params = tuple(item_ids)
+        sql += " ORDER BY id"
         with self.connection() as db:
-            rows = db.execute("""SELECT appid,hash_name,display_name,app_name,image_url,
-                                target_cents,new_low_enabled,enabled FROM items ORDER BY id""").fetchall()
+            rows = db.execute(sql, params).fetchall()
         records = [dict(row) for row in rows]
         path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
         return len(records)
