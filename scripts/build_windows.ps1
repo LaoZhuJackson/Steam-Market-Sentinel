@@ -46,7 +46,15 @@ Invoke-Step "Check the interpreter ($Python)" {
 
 Invoke-Step "Install dependencies" {
     & $Python -m pip install --upgrade pip
-    & $Python -m pip install ".[dev]"
+    # -e matters: a non-editable `pip install .` leaves a COPY in site-packages that
+    # shadows src/. The app then loads stale code (main.py sits at the repo root, so
+    # src/ is not on sys.path) while the tests still pass, because pyproject sets
+    # pythonpath=src. --onedir bundles that stale copy too.
+    & $Python -m pip install -e ".[dev]"
+}
+
+Invoke-Step "Check the package resolves to this checkout" {
+    & $Python -c "import pathlib, steam_market_sentinel as m; p = pathlib.Path(m.__file__).resolve(); root = pathlib.Path(r'$Root').resolve(); assert root in p.parents, 'steam_market_sentinel loads from ' + str(p) + ' - fix with: pip install -e .'; print('  resolves to ' + str(p.parent))"
 }
 
 Invoke-Step "Run the test suite" { & $Python -m pytest -q }
@@ -97,4 +105,4 @@ if ($OneFile) {
     Write-Host ('To distribute, ZIP this whole folder: {0}' -f $Folder)
 }
 Write-Host "Builds are unsigned, so the first run may show a SmartScreen warning."
-# Tip: pass -Python <path> to build with a specific interpreter (e.g. a conda env).
+# powershell -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1 -OneFile -Python "D:\Learning\compilingEnvironment\miniconda\envs\steam-market\python.exe"

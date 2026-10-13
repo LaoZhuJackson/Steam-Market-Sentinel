@@ -1,12 +1,15 @@
 """Qt startup smoke tests; skipped only when PySide6 is not installed."""
 import os
+import time
 
 import pytest
 
 PySide6 = pytest.importorskip("PySide6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QPointF
-from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMessageBox
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QDialogButtonBox, QMessageBox, QPushButton,
+)
 
 from steam_market_sentinel import ui as ui_module
 
@@ -16,8 +19,26 @@ from steam_market_sentinel.models import MarketItem
 from steam_market_sentinel.steam_api import SteamMarketClient
 from steam_market_sentinel.style import PALETTE, STYLE, apply_theme
 from steam_market_sentinel.ui import (
-    MainWindow, SearchAddDialog, history_snippet, point_tooltip_text,
+    ImportHistoryDialog, MainWindow, SearchAddDialog, history_snippet, point_tooltip_text,
 )
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """No test may reach Steam.
+
+    The UI now lazily fetches a missing thumbnail, so merely selecting an item can
+    start a request. Blocking every client entry point keeps the suite offline (and
+    turns an accidental call into a loud failure rather than a slow, flaky one).
+    """
+    def explode(*_args, **_kwargs):
+        raise AssertionError("测试不应发起网络请求")
+
+    for method in ("icon_url", "search", "price", "official_history"):
+        monkeypatch.setattr(SteamMarketClient, method, explode)
+    # Images are fetched with requests rather than Qt's network stack, so block that
+    # entry point as well.
+    monkeypatch.setattr(ui_module, "_fetch_image_bytes", explode)
 
 
 def _window(tmp_path, db):
@@ -215,6 +236,59 @@ def test_the_chart_never_calls_the_network(monkeypatch, tmp_path):
     monkeypatch.setattr(SteamMarketClient, "official_history", explode)
     app, window = _window(tmp_path, db)
     assert window.chart.chart().series()[0].count() == 1
+    window.close()
+
+
+def test_image_bytes_reach_the_label_and_the_cache(monkeypatch, tmp_path):
+    # The image pipeline: URL -> requests (never Qt's network stack) -> QPixmap ->
+    # cache + label. Qt's own network crash cannot be unit-tested, so at least lock
+    # the wiring so a regression shows up here.
+    from PySide6.QtGui import QColor, QPixmap
+
+    # Write the seed image to a file rather than QBuffer(QByteArray()): that
+    # constructor keeps a pointer to a temporary and crashes on use.
+    seed = tmp_path / "seed.png"
+    source = QPixmap(4, 4)
+    source.fill(QColor("#67e3be"))
+    assert source.save(str(seed), "PNG")
+    png = seed.read_bytes()
+
+    host = "https://community.steamstatic.com/economy/image/x"
+    db = Database(tmp_path / "data.sqlite")
+    item = db.add_item(MarketItem(730, "Revolution Case", "Revolution Case"), 900)
+    db.set_item_image(item, host)
+    monkeypatch.setattr(ui_module, "_fetch_image_bytes", lambda _url: png)
+
+    app, window = _window(tmp_path, db)
+    for _ in range(100):
+        app.processEvents()
+        if window._image_cache:
+            break
+        time.sleep(0.02)
+    assert host in window._image_cache          # fetched, decoded and cached
+    assert not window.image.pixmap().isNull()   # and shown in the panel
+    window.close()
+
+
+def test_the_import_dialog_offers_the_item_page():
+    # Opening the item page belongs in the import flow: the snippet has to run there.
+    QApplication.instance() or QApplication([])
+    dialog = ImportHistoryDialog(None, "Revolution Case", "CNY",
+                                 "https://steamcommunity.com/market/listings/730/Revolution%20Case")
+    labels = [widget.text() for widget in dialog.findChildren(QPushButton)]
+    assert "在 Steam 中查看" in labels
+    assert "复制浏览器脚本" in labels
+    dialog.close()
+
+
+def test_thumbnail_fetch_is_attempted_only_once_per_item(tmp_path):
+    db = Database(tmp_path / "data.sqlite")
+    item = db.add_item(MarketItem(730, "Revolution Case", "Revolution Case"), 900)
+    app, window = _window(tmp_path, db)
+    assert item in window._thumb_tried  # attempted for the imageless item
+    window.ensure_thumbnail({"id": item, "appid": 730, "hash_name": "Revolution Case",
+                             "image_url": ""})
+    assert len(window._thumb_tried) == 1  # not retried on every selection
     window.close()
 
 

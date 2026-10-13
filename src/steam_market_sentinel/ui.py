@@ -7,11 +7,11 @@ import sqlite3
 from pathlib import Path
 import webbrowser
 
+import requests
 from PySide6.QtCharts import QChart, QChartView, QLineSeries
 from PySide6.QtCore import QDateTime, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (QAction, QBrush, QColor, QCursor, QFont, QIcon, QPainter, QPen,
                            QPixmap)
-from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout,
@@ -77,6 +77,13 @@ def history_snippet(currency: str) -> str:
     currency_id, country, _symbol = CURRENCIES[currency]
     return _HISTORY_SNIPPET.replace("__REQUESTED_CURRENCY__",
                                     f"&currency={currency_id}&country={country}")
+
+
+def _fetch_image_bytes(url: str) -> bytes:
+    """Fetch an image with `requests` — never Qt's network stack (see _run_image_task)."""
+    response = requests.get(url, timeout=(8, 20))
+    response.raise_for_status()
+    return response.content
 
 
 def point_tooltip_text(symbol: str, stamp: int, price: float) -> str:
@@ -502,11 +509,16 @@ class SettingsDialog(QDialog):
 
 
 class ImportHistoryDialog(QDialog):
-    """把浏览器里一次性取到的官方成交历史粘贴或载入进来。"""
+    """把浏览器里一次性取到的官方成交历史粘贴或载入进来。
 
-    def __init__(self, parent, item_name: str, currency: str = "CNY"):
+    打开商品页的动作放在这里：导入流程本来就要在浏览器里打开该商品页面，把
+    「在 Steam 中查看」放在同一步更顺手。
+    """
+
+    def __init__(self, parent, item_name: str, currency: str = "CNY", item_url: str = ""):
         super().__init__(parent)
         self.currency = currency
+        self.item_url = item_url
         self.setWindowTitle("导入官方成交历史")
         self.resize(660, 470)
         layout = QVBoxLayout(self)
@@ -518,17 +530,22 @@ class ImportHistoryDialog(QDialog):
         steps = QLabel(
             "Steam 只把成交历史发给【已登录】的会话（未登录会返回 400），"
             "而本程序不会索取或保存任何 Steam 凭据，因此请在你的浏览器里取一次：\n"
-            "1. 在浏览器中登录 Steam，并打开该商品的市场页面；\n"
+            "1. 点「在 Steam 中查看」打开该商品页面（确认浏览器里已登录 Steam）；\n"
             "2. 按 F12 → Console，粘贴「复制浏览器脚本」得到的脚本并回车；\n"
             "3. 把复制到的结果粘贴到下面的框里（也可先另存为文件再「从文件读取…」）。")
         steps.setObjectName("hint")
         steps.setWordWrap(True)
         layout.addWidget(steps)
         actions = QHBoxLayout()
+        open_btn = button("在 Steam 中查看")
+        open_btn.setToolTip("在浏览器中打开该商品页面 —— 脚本就是要在这个页面上运行")
+        open_btn.setEnabled(bool(item_url))
+        open_btn.clicked.connect(self.open_market)
         copy_btn = button("复制浏览器脚本")
         copy_btn.clicked.connect(self.copy_snippet)
         read_btn = button("从文件读取…")
         read_btn.clicked.connect(self.load_file)
+        actions.addWidget(open_btn)
         actions.addWidget(copy_btn)
         actions.addWidget(read_btn)
         actions.addStretch(1)
@@ -547,6 +564,10 @@ class ImportHistoryDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def open_market(self):
+        if self.item_url:
+            webbrowser.open(self.item_url)
 
     def copy_snippet(self):
         QApplication.clipboard().setText(history_snippet(self.currency))
@@ -588,9 +609,10 @@ class MainWindow(QMainWindow):
         self._pending_refresh = False
         self._image_cache: dict[str, QPixmap] = {}
         self._chart_key: tuple | None = None
+        self._thumb_tried: set[int] = set()
+        self._image_tasks: list[BackgroundCall] = []
         self._quitting = False
         self.current_item_id: int | None = None
-        self.network = QNetworkAccessManager(self)
         self.setWindowIcon(app_icon())
         self.setWindowTitle("Steam Market Sentinel · Steam 市场价格哨兵")
         self.resize(1300, 900)
@@ -761,13 +783,10 @@ class MainWindow(QMainWindow):
         item_actions = QHBoxLayout()
         save = button("保存规则", primary=True)
         save.clicked.connect(self.save_rule)
-        market = button("在 Steam 中查看")
-        market.clicked.connect(self.open_market)
         delete = button("移除")
         delete.setObjectName("danger")
         delete.clicked.connect(self.remove_item)
         item_actions.addWidget(save)
-        item_actions.addWidget(market)
         item_actions.addStretch()
         item_actions.addWidget(delete)
         rv.addLayout(item_actions)
@@ -952,7 +971,50 @@ class MainWindow(QMainWindow):
         if changed:
             self._load_image(item.get("image_url") or "", item_id)
             self.settings.selected_item = item_id
+        self.ensure_thumbnail(item)
         self.refresh_chart()
+
+    def ensure_thumbnail(self, item: dict) -> None:
+        """Fetch a missing thumbnail once per item, off the GUI thread.
+
+        Items added by pasting a link have no icon (search-based adds do), so the
+        listing page's og:image fills it in and it is then stored in the database.
+        Failures are silent: a missing thumbnail is cosmetic and must not surface as
+        an error, nor be retried in a loop.
+        """
+        item_id = item["id"]
+        if item.get("image_url") or item_id in self._thumb_tried:
+            return
+        self._thumb_tried.add(item_id)
+        self._run_image_task(
+            lambda: SteamMarketClient(retries=0).icon_url(item["appid"], item["hash_name"]),
+            lambda url: self.on_thumbnail(item_id, url))
+
+    def on_thumbnail(self, item_id: int, url: str):
+        if not url:
+            return
+        self.db.set_item_image(item_id, url)
+        if self.current_item_id == item_id:
+            self._load_image(url, item_id)
+
+    def _run_image_task(self, callback, on_success):
+        """Run an image fetch off the GUI thread.
+
+        Images deliberately do **not** go through Qt's network stack: this process
+        already uses `requests` (Python's OpenSSL) for every Steam call, and mixing
+        the two segfaults on Windows — QNetworkAccessManager's HTTPS crashes as soon
+        as Python's ssl has been used. `requests` in a worker thread is safe.
+
+        Finished threads are only pruned on a later call: dropping the last reference
+        *inside* a `finished` slot crashes, because Qt emits that signal while the
+        thread is still winding down.
+        """
+        self._image_tasks = [task for task in self._image_tasks if not task.isFinished()]
+        task = BackgroundCall(callback)
+        task.succeeded.connect(on_success)
+        task.failed.connect(lambda _error: None)  # a missing image is not an error
+        self._image_tasks.append(task)
+        task.start()
 
     def _load_image(self, address: str, item_id: int):
         self.image.setPixmap(QPixmap())
@@ -965,24 +1027,20 @@ class MainWindow(QMainWindow):
         parsed = QUrl(address)
         if not address or parsed.scheme() != "https" or not parsed.host().endswith(".steamstatic.com"):
             return
-        req = QNetworkRequest(parsed)
-        reply = self.network.get(req)
+        self._run_image_task(lambda: _fetch_image_bytes(address),
+                             lambda data: self.on_image_bytes(address, item_id, data))
 
-        def finished():
-            try:
-                if reply.error() == 0:
-                    pix = QPixmap()
-                    if pix.loadFromData(reply.readAll()):
-                        scaled = pix.scaled(84, 84, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                        if len(self._image_cache) > 256:  # keep the cache bounded
-                            self._image_cache.clear()
-                        self._image_cache[address] = scaled
-                        if self.current_item_id == item_id:
-                            self.image.setPixmap(scaled)
-                            self.image.setText("")
-            finally:
-                reply.deleteLater()
-        reply.finished.connect(finished)
+    def on_image_bytes(self, address: str, item_id: int, data: bytes):
+        pix = QPixmap()
+        if not data or not pix.loadFromData(data):
+            return
+        scaled = pix.scaled(84, 84, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        if len(self._image_cache) > 256:  # keep the cache bounded
+            self._image_cache.clear()
+        self._image_cache[address] = scaled
+        if self.current_item_id == item_id:
+            self.image.setPixmap(scaled)
+            self.image.setText("")
 
     def draw_chart(self, points: list[tuple[int, float]], title: str, symbol: str = ""):
         chart = QChart()
@@ -1080,7 +1138,8 @@ class MainWindow(QMainWindow):
         item = self.db.get_item(self.current_item_id, self.settings.currency)
         if item is None:
             return
-        dialog = ImportHistoryDialog(self, item["display_name"], self.settings.currency)
+        dialog = ImportHistoryDialog(self, item["display_name"], self.settings.currency,
+                                     listing_url(item["appid"], item["hash_name"]))
         if dialog.exec() != QDialog.Accepted:
             return
         try:
@@ -1146,13 +1205,6 @@ class MainWindow(QMainWindow):
         self.log("监控规则已保存；目标价按当前选择币种填写")
         if self.worker and self.worker.isRunning():
             self.worker.refresh_now()
-
-    def open_market(self):
-        if self.current_item_id is None:
-            return
-        item = self.db.get_item(self.current_item_id, self.settings.currency)
-        if item:
-            webbrowser.open(listing_url(item["appid"], item["hash_name"]))
 
     def start_monitor(self):
         if self.worker and self.worker.isRunning():
@@ -1262,6 +1314,9 @@ class MainWindow(QMainWindow):
         if self.worker and self.worker.isRunning():
             self.worker.stop()
             self.worker.wait(60000)
+        for task in list(self._image_tasks):
+            if task.isRunning():
+                task.wait(5000)
         if self.tray:
             self.tray.hide()
         try:

@@ -185,6 +185,15 @@ def test_official_history_reimport_replaces_wholesale(tmp_path):
     assert db.merged_point_counts(item, "CNY") == (1, 2)  # still exactly two
 
 
+def test_set_item_image_fills_in_a_missing_thumbnail(tmp_path):
+    # Items added by pasting a link arrive without an icon; the UI fetches it later.
+    db = Database(tmp_path / "db.sqlite")
+    item = db.add_item(MarketItem(730, "Revolution Case", "Revolution Case"))
+    assert db.get_item(item, "CNY")["image_url"] == ""
+    db.set_item_image(item, "https://community.steamstatic.com/economy/image/abc")
+    assert db.get_item(item, "CNY")["image_url"].endswith("/image/abc")
+
+
 def test_official_history_dedupes_and_cascades(tmp_path):
     db = Database(tmp_path / "db.sqlite")
     item = sample(db)

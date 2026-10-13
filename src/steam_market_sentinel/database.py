@@ -172,6 +172,15 @@ class Database:
         with self.connection() as db:
             db.execute("DELETE FROM items WHERE id=?", (item_id,))
 
+    def set_item_image(self, item_id: int, url: str) -> None:
+        """Store a thumbnail URL fetched after the item was added.
+
+        Items added by pasting a link arrive without one; the poller never touches
+        this, it is filled in once by the UI.
+        """
+        with self.connection() as db:
+            db.execute("UPDATE items SET image_url=? WHERE id=?", (url, item_id))
+
     def set_error(self, item_id: int, message: str) -> None:
         with self.connection() as db:
             db.execute("UPDATE items SET last_error=? WHERE id=?", (message[:300], item_id))

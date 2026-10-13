@@ -3,7 +3,7 @@ import json
 import pytest
 
 from steam_market_sentinel.steam_api import (
-    SteamAPIError, SteamMarketClient, parse_imported_history,
+    SteamAPIError, SteamMarketClient, parse_icon_url, parse_imported_history,
 )
 
 
@@ -95,6 +95,31 @@ def test_anonymous_history_rejection_is_explained():
     message = str(excinfo.value)
     assert "未登录" in message
     assert "steamcommunity.com" not in message
+
+
+OG_PAGE = ('<html><head><meta property="og:image" '
+           'content="https://community.steamstatic.com/economy/image/ABC123"></head></html>')
+
+
+def test_parse_icon_url_reads_the_opengraph_tag():
+    assert parse_icon_url(OG_PAGE).endswith("/economy/image/ABC123")
+
+
+def test_parse_icon_url_accepts_reversed_attribute_order():
+    page = ('<meta content="https://community.steamstatic.com/economy/image/X" '
+            'property="og:image">')
+    assert parse_icon_url(page).endswith("/economy/image/X")
+
+
+@pytest.mark.parametrize("page", [
+    "<html><head></head></html>",                                          # no tag at all
+    '<meta property="og:image" content="http://x.steamstatic.com/a">',      # not https
+    '<meta property="og:image" content="https://evil.example.com/a">',      # not Steam's CDN
+    '<meta property="og:image" content="">',
+])
+def test_parse_icon_url_rejects_anything_unusable(page):
+    # A page must not be able to point the app at an arbitrary host.
+    assert parse_icon_url(page) == ""
 
 
 def test_imported_history_parses_the_canonical_response():

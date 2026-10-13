@@ -105,7 +105,7 @@ Click **＋ 添加商品**, then use the **single** input box in either way:
 
 Either route funnels into the same "will be added" summary card. The Add button stays disabled until a concrete item is selected, so you can no longer fill in the wrong box. You can also tick "enable target price" and set a threshold at the same time.
 
-After adding, the poller fetches prices and the right-hand panel shows the thumbnail and the local price chart.
+After adding, the poller fetches prices and the right-hand panel shows the thumbnail and the local price chart. Items **added by pasting a link start without an image**; selecting one makes the app read the thumbnail from its item page once (stored locally afterwards, and a failure just leaves the placeholder rather than reporting an error).
 
 ### Monitoring and alert rules
 
@@ -117,7 +117,9 @@ Select an item in the watchlist to edit its rules on the right:
 | Alert on a new all-time low | Notifies when the price strictly beats the previous all-time low. **The first sample only establishes a baseline and does not alert.** |
 | Enable monitoring for this item | Unchecking pauses polling; the existing local history is kept. |
 
-Buttons below: **Save rule**, **View on Steam**, **Remove**. Removing also deletes that item's local history — export first if you want to keep it.
+Buttons below: **Save rule**, **Remove**. Removing also deletes that item's local history — export first if you want to keep it.
+
+**View on Steam** now lives inside the "导入官方历史…" dialog: the import flow requires opening that page in your browser anyway, so having it in the same step is handier.
 
 Settings additionally has a **global** switch, "**Notify when the price drops**": it notifies whenever this cycle's lowest price is below the previous local sample. It is independent of the two rules above and unaffected by the all-time low — after importing an official history it is usually more useful than "new all-time low".
 
@@ -133,7 +135,7 @@ The filter box above the watchlist narrows it by name; **Refresh now** starts th
 
 Alongside the **lowest asking price** it polls itself, the app can import Steam's official **median sale price** history, which is merged into the same line (see below). Steam only serves that data to a **logged-in** session: while anonymous, the identical request returns **HTTP 400** (verified from this app *and* from a browser console on the item page). The app deliberately never asks for or stores Steam credentials, so it is obtained **once from your browser** and imported:
 
-1. **Log in to Steam in your browser**, then open the item's market page (without logging in you will always get 400).
+1. **Log in to Steam in your browser**, then open the item's market page (without logging in you will always get 400) — the dialog's "在 Steam 中查看" button opens it for you.
 2. Press **F12 → Console**, paste the snippet below and hit Enter (the "导入官方历史…" dialog has a "复制浏览器脚本" button that copies it for you).
 3. The script copies the result to your clipboard — paste it into the dialog (or save it to a file and use "从文件读取…"), then click import.
 

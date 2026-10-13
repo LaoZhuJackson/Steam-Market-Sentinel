@@ -6,7 +6,7 @@ import json
 import re
 import random
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 
@@ -17,6 +17,14 @@ IMAGE_PREFIX = "https://community.fastly.steamstatic.com/economy/image/"
 
 _DATE_PREFIX = re.compile(r"[A-Za-z]{3}\s+\d{1,2}\s+\d{4}\s+\d{2}")
 
+# The listing page advertises the item icon in its OpenGraph tags. That is a stable,
+# documented place for it — unlike the page's own hashed class names — so it is the
+# only part of the markup this app reads. Both attribute orders are accepted.
+_OG_IMAGE_PATTERNS = (
+    r"""<meta[^>]+property=["']og:image["'][^>]*?content=["']([^"']+)["']""",
+    r"""<meta[^>]+content=["']([^"']+)["'][^>]*?property=["']og:image["']""",
+)
+
 
 class SteamAPIError(Exception):
     """A failed Steam call, with a message safe to show to the user."""
@@ -24,6 +32,24 @@ class SteamAPIError(Exception):
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
         self.status = status
+
+
+def parse_icon_url(html: str) -> str:
+    """The item thumbnail Steam advertises in a listing page's OpenGraph tags.
+
+    Returns ``""`` when there is no usable ``og:image`` — only HTTPS URLs on Steam's
+    image CDN are accepted, so a page cannot point the app at an arbitrary host.
+    """
+    for pattern in _OG_IMAGE_PATTERNS:
+        match = re.search(pattern, html, re.I)
+        if not match:
+            continue
+        url = match.group(1).strip()
+        parsed = urlsplit(url)
+        host = parsed.hostname or ""
+        if parsed.scheme == "https" and host.endswith(".steamstatic.com"):
+            return url
+    return ""
 
 
 def parse_history_entries(entries) -> list[tuple[int, float]]:
@@ -204,6 +230,18 @@ class SteamMarketClient:
                 break
             time.sleep(1.5)
         return result
+
+    def icon_url(self, appid: int, hash_name: str) -> str:
+        """The item's thumbnail URL, read from its public listing page.
+
+        One anonymous request, only made for items that have no image yet (those
+        added by pasting a link; the search path already returns icons).
+        """
+        html = self._request(f"{ROOT}/listings/{appid}/{quote(hash_name, safe='')}").text
+        url = parse_icon_url(html)
+        if not url:
+            raise SteamAPIError("Steam 商品页面未提供商品图片")
+        return url
 
     def official_history(self, appid: int, hash_name: str) -> tuple[list[tuple[int, float]], str]:
         """Steam median *sales* history, not the current lowest ask.
