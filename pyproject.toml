@@ -28,6 +28,10 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+  "network: tests requiring external network access"
+]
+addopts = "-m 'not network'"
 
 [tool.ruff]
 line-length = 100

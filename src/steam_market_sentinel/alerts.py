@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from email.message import EmailMessage
 import smtplib
+import ssl
 from urllib.parse import urlsplit
 
 import requests
@@ -66,7 +67,19 @@ def _smtp_send(settings: Settings, subject: str, body: str) -> None:
     mail["To"] = receiver
     mail["Subject"] = subject
     mail.set_content(body)
-    with smtplib.SMTP_SSL("smtp.qq.com", 465, timeout=15) as server:
+
+    context = ssl.create_default_context()
+
+    with smtplib.SMTP("smtp.qq.com", 587, timeout=15) as server:
+        server.ehlo()
+
+        if not server.has_extn("starttls"):
+            raise smtplib.SMTPNotSupportedError(
+                "SMTP 服务器未提供 STARTTLS"
+            )
+        server.starttls(context=context)
+        server.ehlo()
+        
         server.login(sender, password)
         server.send_message(mail)
 
