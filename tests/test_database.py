@@ -185,6 +185,20 @@ def test_official_history_reimport_replaces_wholesale(tmp_path):
     assert db.merged_point_counts(item, "CNY") == (1, 2)  # still exactly two
 
 
+def test_target_alert_is_reached_at_equality(tmp_path):
+    # The rule is "<=" — landing exactly on the target counts as reaching it.
+    db = Database(tmp_path / "db.sqlite")
+    item = sample(db)  # target 900
+    db.record_snapshot(item, "CNY", 1000, checked_at=1000)
+    just_above = db.record_snapshot(item, "CNY", 901, checked_at=1001)
+    assert "target" not in [alert.rule for alert in just_above]
+
+    equal = db.record_snapshot(item, "CNY", 900, checked_at=1002)
+    rules = [alert.rule for alert in equal]
+    assert "target" in rules
+    assert equal[rules.index("target")].comparison_cents == 900
+
+
 def test_a_successful_poll_clears_the_error(tmp_path):
     # Otherwise the watchlist stays 异常 after the network comes back.
     db = Database(tmp_path / "db.sqlite")

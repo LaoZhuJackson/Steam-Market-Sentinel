@@ -350,6 +350,37 @@ def test_each_row_has_a_remove_button(monkeypatch, tmp_path):
     window.close()
 
 
+def test_chart_range_narrows_the_visible_window(tmp_path):
+    # An old spike used to flatten everything recent; the range keeps the window tight.
+    db = Database(tmp_path / "data.sqlite")
+    item = db.add_item(MarketItem(730, "Revolution Case", "Revolution Case"), 900)
+    now = int(time.time())
+    db.record_snapshot(item, "CNY", 5000, checked_at=now - 40 * 86400)
+    db.record_snapshot(item, "CNY", 1000, checked_at=now - 2 * 86400)
+    app, window = _window(tmp_path, db)
+    assert window.chart.chart().series()[0].count() == 2  # 全部
+
+    window.range_combo.setCurrentIndex(window._range_index(7))
+    app.processEvents()
+    assert window.chart.chart().series()[0].count() == 1  # only the recent sample
+    assert "最近 7 天内的" in window.history_hint.text()
+    assert window.settings.chart_range_days == 7
+    window.close()
+
+
+def test_chart_range_says_so_when_the_window_is_empty(tmp_path):
+    # Picking a narrow range on an old item must not look like the data vanished.
+    db = Database(tmp_path / "data.sqlite")
+    item = db.add_item(MarketItem(730, "Revolution Case", "Revolution Case"), 900)
+    db.record_snapshot(item, "CNY", 1000, checked_at=int(time.time()) - 40 * 86400)
+    app, window = _window(tmp_path, db)
+    window.range_combo.setCurrentIndex(window._range_index(7))
+    app.processEvents()
+    assert "所选时间范围内没有数据" in window.chart.chart().title()
+    assert "全部" in window.history_hint.text()
+    window.close()
+
+
 def test_rule_edits_are_saved_immediately(tmp_path):
     # The reported bug: setting a target, switching item and coming back showed it
     # unset, because nothing was written until the (removed) Save button was pressed.

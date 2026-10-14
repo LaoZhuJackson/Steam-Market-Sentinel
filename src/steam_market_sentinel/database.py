@@ -326,18 +326,24 @@ class Database:
         points = [(int(row[0]), int(row[1])) for row in rows]
         return points, str(rows[0][2]), int(rows[0][3])
 
-    def merged_point_counts(self, item_id: int, currency: str) -> tuple[int, int]:
+    def merged_point_counts(self, item_id: int, currency: str,
+                            since: int | None = None) -> tuple[int, int]:
         """``(local samples, imported points)`` that make up this currency's series.
 
         The imported count is currency-scoped because that is exactly what
         ``get_history`` merges — an import made under another currency stays out.
+        ``since`` restricts both counts to the window the chart is showing, so the
+        numbers in the UI always describe the curve that is actually drawn.
         """
+        window = " AND recorded_at>=?" if since is not None else ""
+        extra: tuple = (since,) if since is not None else ()
         with self.connection() as db:
-            local = db.execute("SELECT COUNT(*) FROM snapshots WHERE item_id=? AND currency=?",
-                               (item_id, currency)).fetchone()[0]
+            local = db.execute(
+                "SELECT COUNT(*) FROM snapshots WHERE item_id=? AND currency=?" + window,
+                (item_id, currency) + extra).fetchone()[0]
             imported = db.execute(
-                "SELECT COUNT(*) FROM official_prices WHERE item_id=? AND currency=?",
-                (item_id, currency)).fetchone()[0]
+                "SELECT COUNT(*) FROM official_prices WHERE item_id=? AND currency=?" + window,
+                (item_id, currency) + extra).fetchone()[0]
         return int(local), int(imported)
 
     def export_history_csv(self, path: Path, currency: str,

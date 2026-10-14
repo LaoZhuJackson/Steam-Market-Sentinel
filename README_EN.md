@@ -133,6 +133,8 @@ Settings additionally has a **global** switch, "**Notify when the price drops**"
 
 **Reading the curve**: **hovering any data point** shows its timestamp and price. Dense series (e.g. a few hundred imported official points) drop the marker dots so they do not merge into a blob, while sparse ones keep them — a lone point draws no line, so it needs its marker. If the window is too short, the detail panel scrolls rather than squashing the chart.
 
+The **time range** selector above the chart can show just the last 7 / 30 / 90 days or a year ("all" by default). An old spike flattens everything recent into a straight line; narrowing the range rescales the vertical axis to that window, so small moves become readable — and the choice is remembered. If the window is that narrow and there is nothing in it, the chart says "所选时间范围内没有数据" instead of looking like there is no data at all.
+
 The app **remembers the selected item** and reopens on the same view (imported official history lives in the local database, so it is never lost). There is one price chart: local samples and any imported official history are shown merged, not as two switchable modes.
 
 The filter box above the watchlist narrows it by name; **Refresh now** starts the next cycle as soon as the current one finishes.

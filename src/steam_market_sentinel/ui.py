@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCharts import QDateTimeAxis, QValueAxis
 
 from .alerts import SecretStore, render_alert, send_test
-from .config import Settings
+from .config import CHART_RANGES, Settings
 from .database import Database
 from .models import Alert, CURRENCIES, MarketItem, cents_text, from_amount, listing_url, parse_listing_url
 from .monitor import MonitorWorker
@@ -793,6 +793,14 @@ class MainWindow(QMainWindow):
         chart_label.setObjectName("section")
         chart_actions.addWidget(chart_label)
         chart_actions.addStretch()
+        self.range_combo = QComboBox()
+        self.range_combo.addItems([label for label, _days in CHART_RANGES])
+        self.range_combo.setToolTip("只画这段时间内的数据；早期的剧烈波动会压平近期的小变化，"
+                                    "选一个较窄的范围就能看清")
+        self.range_combo.setCurrentIndex(self._range_index(self.settings.chart_range_days))
+        self.range_combo.currentIndexChanged.connect(self.on_chart_range_changed)
+        chart_actions.addWidget(QLabel("时间范围"))
+        chart_actions.addWidget(self.range_combo)
         import_history = button("导入官方历史…")
         import_history.setToolTip("在 Steam 商品页用一行脚本取一次官方成交历史再粘贴进来；程序不接触任何凭据")
         import_history.clicked.connect(self.import_official_history)
@@ -1260,33 +1268,58 @@ class MainWindow(QMainWindow):
         item = self.db.get_item(self.current_item_id, self.settings.currency)
         if item is None:
             return
-        history = self.db.get_history(item["id"], self.settings.currency)
-        local_count, imported_count = self.db.merged_point_counts(item["id"],
-                                                                  self.settings.currency)
+        days = self.settings.chart_range_days
+        everything = self.db.get_history(item["id"], self.settings.currency)
+        since = int(datetime.now().timestamp()) - days * 86400 if days else None
+        history = [row for row in everything if since is None or row[0] >= since]
+        local_count, imported_count = self.db.merged_point_counts(
+            item["id"], self.settings.currency, since)
         # Polling refreshes this view every few hundred ms; rebuilding an identical
         # chart each time is pure flicker.
-        key = (item["id"], self.settings.currency, len(history),
+        key = (item["id"], self.settings.currency, days, len(history),
                history[-1][0] if history else 0, imported_count)
         if key == self._chart_key:
             return
         self._chart_key = key
+        if not history:
+            # Distinguish "nothing inside this window" from "nothing at all" —
+            # otherwise picking 7 days on an old item looks like data loss.
+            if everything:
+                self.draw_chart([], f"所选时间范围内没有数据 · {self.settings.currency}")
+                self.history_hint.setText(
+                    f"最近 {days} 天没有采样点；把「时间范围」切到「全部」可以看到更早的记录。")
+            else:
+                self.draw_chart([], "尚无记录")
+                self.history_hint.setText(
+                    "尚无采样点 · 本地采样在价格变化时记录、未变化时每 6 小时记录一次；"
+                    "也可以点「导入官方历史…」从浏览器导入该商品的官方成交历史。")
+            return
         title = f"本地最低在售价格 · {self.settings.currency}"
         if imported_count:
             # Name both quantities: the line is no longer only local samples.
             title = f"最低挂单价 + 官方成交中位价 · {self.settings.currency}"
-        self.draw_chart([(stamp, amount / 100) for stamp, amount in history],
-                        title if history else "尚无记录",
+        self.draw_chart([(stamp, amount / 100) for stamp, amount in history], title,
                         CURRENCIES[self.settings.currency][2])
+        scope = f"最近 {days} 天内的 " if days else ""
         if imported_count:
-            hint = (f"{len(history)} 个采样点 = 本地 {local_count} + 导入的官方成交中位价 "
+            hint = (f"{scope}{len(history)} 个采样点 = 本地 {local_count} + 导入的官方成交中位价 "
                     f"{imported_count}")
-        elif history:
-            hint = (f"{len(history)} 个采样点 · 只记录开始监控后的最低挂单价：价格变化时记录，"
-                    "价格未变时每 6 小时记录一次——短时间内曲线不变是正常的。")
         else:
-            hint = ("尚无采样点 · 本地采样在价格变化时记录、未变化时每 6 小时记录一次；"
-                    "也可以点「导入官方历史…」从浏览器导入该商品的官方成交历史。")
+            hint = (f"{scope}{len(history)} 个采样点 · 只记录开始监控后的最低挂单价："
+                    "价格变化时记录，价格未变时每 6 小时记录一次——短时间内曲线不变是正常的。")
         self.history_hint.setText(hint)
+
+    @staticmethod
+    def _range_index(days: int) -> int:
+        for index, (_label, value) in enumerate(CHART_RANGES):
+            if value == days:
+                return index
+        return 0  # 全部
+
+    def on_chart_range_changed(self, index: int):
+        self.settings.chart_range_days = CHART_RANGES[index][1]
+        self._chart_key = None
+        self.refresh_chart()
 
     def import_official_history(self):
         if self.current_item_id is None:

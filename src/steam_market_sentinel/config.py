@@ -6,6 +6,16 @@ import json
 import os
 from pathlib import Path
 
+# Chart time ranges offered in the UI: label shown to the user -> days kept (0 = all).
+CHART_RANGES = (
+    ("全部", 0),
+    ("最近 7 天", 7),
+    ("最近 30 天", 30),
+    ("最近 90 天", 90),
+    ("最近 1 年", 365),
+)
+_CHART_RANGE_DAYS = {days for _label, days in CHART_RANGES}
+
 
 def data_directory() -> Path:
     forced = os.environ.get("SMS_DATA_DIR")
@@ -44,6 +54,9 @@ class Settings:
     # this the app always came back on the first row, which made an imported
     # official series look as though it had not been saved.
     selected_item: int | None = None
+    # How much of the price history the chart shows. Narrow ranges keep recent small
+    # moves readable when an old spike would otherwise flatten the whole curve.
+    chart_range_days: int = 0
 
     @classmethod
     def load(cls, path: Path) -> "Settings":
@@ -61,6 +74,8 @@ class Settings:
             # Tolerate hand-edited or older files without discarding the rest.
             config.selected_item = (config.selected_item
                                     if isinstance(config.selected_item, int) else None)
+            config.chart_range_days = (config.chart_range_days
+                                       if config.chart_range_days in _CHART_RANGE_DAYS else 0)
             return config
         except (ValueError, TypeError, OSError, AttributeError):
             return cls()
