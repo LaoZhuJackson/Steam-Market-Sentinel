@@ -3,7 +3,7 @@ import sqlite3
 
 import pytest
 
-from steam_market_sentinel.database import Database
+from steam_market_sentinel.database import Database, parse_history_csv
 from steam_market_sentinel.models import MarketItem
 
 
@@ -331,3 +331,145 @@ def test_import_continues_after_duplicate_row(tmp_path):
     assert db.import_watchlist(path) == (1, 1)
     assert {row["hash_name"] for row in db.list_items("CNY")} == {
         "Revolution Case", "Inscribed Gem"}
+
+
+def test_history_csv_round_trip_restores_the_series(tmp_path):
+    # The export is also an import format: this is how a series moves to another
+    # machine. 史低, 现价 and the export itself must all come back identical.
+    source = Database(tmp_path / "source.sqlite")
+    item = sample(source)  # target 900
+    source.record_snapshot(item, "CNY", 1000, checked_at=1000)
+    source.record_snapshot(item, "CNY", 800, checked_at=2000)
+    source.save_official_history(item, [(500, 50), (600, 70)], "¥…", "CNY")
+    exported = tmp_path / "prices.csv"
+    source.export_history_csv(exported, "CNY")
+    # 史低 is the merged minimum, so the official dip is part of it.
+    assert source.get_item(item, "CNY")["low_cents"] == 50
+
+    restored = Database(tmp_path / "restored.sqlite")
+    summary = restored.import_history_csv(exported)
+    assert (summary["rows"], summary["local"], summary["official"]) == (4, 2, 2)
+    assert summary["skipped"] == 0
+    assert summary["currencies"] == {"CNY": 4}
+    row = restored.list_items("CNY")[0]
+    assert row["low_cents"] == 50          # the merged minimum survived
+    assert row["current_cents"] == 800     # still a real observed ask
+    assert restored.official_series(row["id"])[0] == [(500, 50), (600, 70)]
+    assert restored.get_history(row["id"], "CNY") == [
+        (500, 50), (600, 70), (1000, 1000), (2000, 800)]
+
+
+def test_history_csv_import_is_idempotent(tmp_path):
+    # Same file twice: counts must not double, and the second run adds nothing.
+    source = Database(tmp_path / "source.sqlite")
+    item = sample(source)
+    source.record_snapshot(item, "CNY", 1000, checked_at=1000)
+    exported = tmp_path / "prices.csv"
+    source.export_history_csv(exported, "CNY")
+
+    restored = Database(tmp_path / "restored.sqlite")
+    assert restored.import_history_csv(exported)["rows"] == 1
+    again = restored.import_history_csv(exported)
+    assert again["rows"] == 0 and again["duplicate"] == 1
+    assert restored.get_history(item, "CNY") == [(1000, 1000)]
+    # Importing a file into the database it came from is a no-op as well.
+    assert source.import_history_csv(exported)["rows"] == 0
+
+
+def test_history_csv_import_creates_unknown_items_paused(tmp_path):
+    # A file must never start polling something by itself, so an item that is not in
+    # the watchlist comes back paused — visible in the list, not yet monitored.
+    db = Database(tmp_path / "db.sqlite")
+    csv_path = tmp_path / "prices.csv"
+    csv_path.write_text(
+        "appid,market_hash_name,currency,utc_timestamp,lowest_listing_price,volume,source\n"
+        "570,Inscribed Gem,CNY,100,12.34,,local\n", encoding="utf-8-sig")
+
+    summary = db.import_history_csv(csv_path)
+    assert (summary["rows"], summary["created"]) == (1, 1)
+    row = db.list_items("CNY")[0]
+    assert (row["hash_name"], row["enabled"], row["current_cents"]) == (
+        "Inscribed Gem", 0, 1234)
+
+
+def test_history_csv_import_refuses_to_guess_a_source(tmp_path):
+    # An unknown ``source`` is skipped rather than assumed local: official median
+    # *sales* and local lowest *asks* are different quantities and must not swap.
+    db = Database(tmp_path / "db.sqlite")
+    item = sample(db)
+    csv_path = tmp_path / "mixed.csv"
+    csv_path.write_text(
+        "appid,market_hash_name,currency,utc_timestamp,lowest_listing_price,volume,source\n"
+        "730,Revolution Case,CNY,100,5.00,,guessed\n"
+        "730,Revolution Case,CNY,200,6.00,,official\n"
+        "730,Revolution Case,CNY,WAT,7.00,,local\n"
+        "730,Revolution Case,CNY,400,,,local\n",
+        encoding="utf-8-sig")
+
+    summary = db.import_history_csv(csv_path)
+    assert (summary["local"], summary["official"], summary["skipped"]) == (0, 1, 3)
+    assert db.get_history(item, "CNY") == [(200, 600)]  # only the official point
+    assert db.official_series(item)[0] == [(200, 600)]
+
+
+def test_parse_history_csv_matches_columns_by_name(tmp_path):
+    # Excel re-saves these files: column order moves, the BOM disappears, the
+    # encoding becomes GBK, integers grow a ".0". None of that may break an import.
+    text = ("market_hash_name,appid,utc_timestamp,lowest_listing_price,currency\n"
+            "Revolution Case,730.0,100,1.20,CNY\n")
+    rows, skipped = parse_history_csv(text)
+    assert skipped == 0
+    assert rows[0]["hash_name"] == "Revolution Case" and rows[0]["price_cents"] == 120
+    assert rows[0]["source"] == "local" and rows[0]["volume"] is None
+
+    db = Database(tmp_path / "db.sqlite")
+    gbk = tmp_path / "excel.csv"
+    gbk.write_bytes(text.encode("gbk"))
+    assert db.import_history_csv(gbk)["rows"] == 1
+
+    with pytest.raises(ValueError, match="缺少列"):
+        parse_history_csv("name,price\nFoo,1.00\n")
+
+
+def test_the_failure_kind_separates_rate_limits_from_network_errors(tmp_path):
+    # 限流 needs a different remedy from 异常, so the state column has to tell them
+    # apart; a successful poll clears both.
+    db = Database(tmp_path / "db.sqlite")
+    item = sample(db)
+    db.set_error(item, "Steam 限流 (HTTP 429)：…", kind="rate_limit")
+    row = db.get_item(item, "CNY")
+    assert (row["last_error_kind"], row["last_error"].startswith("Steam 限流")) == (
+        "rate_limit", True)
+
+    db.set_error(item, "连接被重置")  # default kind
+    assert db.get_item(item, "CNY")["last_error_kind"] == ""
+
+    db.set_error(item, "又限流了", kind="rate_limit")
+    db.record_snapshot(item, "CNY", 1000, checked_at=1)
+    row = db.get_item(item, "CNY")
+    assert (row["last_error"], row["last_error_kind"]) == (None, "")
+
+
+def test_existing_database_gains_the_failure_kind_column(tmp_path):
+    path = tmp_path / "old.sqlite3"
+    legacy = sqlite3.connect(path)
+    legacy.executescript("""
+        CREATE TABLE items (
+            id INTEGER PRIMARY KEY, appid INTEGER NOT NULL, hash_name TEXT NOT NULL,
+            display_name TEXT NOT NULL, app_name TEXT NOT NULL DEFAULT '',
+            image_url TEXT NOT NULL DEFAULT '', target_cents INTEGER,
+            new_low_enabled INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL, last_checked_at INTEGER, last_error TEXT,
+            UNIQUE(appid, hash_name));
+        INSERT INTO items(appid, hash_name, display_name, created_at, last_error)
+            VALUES(730, 'Old Item', 'Old Item', 5, '连接被重置');
+    """)
+    legacy.commit()
+    legacy.close()
+
+    db = Database(path)
+    row = db.get_item(1, "CNY")
+    assert row["last_error_kind"] == ""      # the row survives the migration
+    assert row["last_error"] == "连接被重置"
+    db.set_error(1, "限流", kind="rate_limit")
+    assert db.get_item(1, "CNY")["last_error_kind"] == "rate_limit"

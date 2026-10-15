@@ -38,6 +38,9 @@ PALETTE = {
     "accent_active": "#4cc4a3",
     "accent_ink": "#0b1f22",
     "danger": "#ff8f7a",
+    # 限流 is not an error the user can fix by waiting with a *network* view: it is a
+    # rate limit, so it gets its own amber rather than the danger red.
+    "warning": "#e8c07d",
     "danger_surface": "#2c1c1c",
     "danger_surface_hover": "#3a2321",
     "danger_border": "#6b3a34",

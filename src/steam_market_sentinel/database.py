@@ -3,17 +3,27 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import csv
+import io
 import json
 from pathlib import Path
 import sqlite3
 import time
 from typing import Iterator
 
-from .models import Alert, MarketItem
+from .models import CURRENCIES, Alert, MarketItem, parse_price_cents
 
 # Imported official history is a display-only series; cap it so a stray paste of
 # something huge cannot fill the local database.
 MAX_OFFICIAL_POINTS = 20000
+
+# The history CSV export is also an import format (see parse_history_csv). Rows are
+# capped so a runaway file cannot fill the database in one go, and ``source`` is
+# only ever one of these two values: guessing would move a median *sale* into the
+# local lowest-*ask* series, corrupting both quantities at once.
+MAX_HISTORY_IMPORT_ROWS = 200000
+_HISTORY_SOURCES = ("local", "official")
+_HISTORY_CSV_REQUIRED = ("appid", "market_hash_name", "currency", "utc_timestamp",
+                         "lowest_listing_price")
 
 # Single source of truth for the item row shape, so get_item and list_items can
 # never drift apart. The four placeholders are the currency, bound in order.
@@ -33,6 +43,69 @@ _ITEM_SELECT = """
        WHERE s.item_id=i.id AND s.currency=?) AS currency_checked_at
     FROM items i
 """
+
+
+def _as_int(value) -> int | None:
+    """Non-negative int from a CSV cell (AppID or epoch); ``None`` if it is not one."""
+    text = str(value).strip()
+    try:
+        number = int(text)
+    except (TypeError, ValueError):
+        try:  # Excel happily turns an integer column into "1712345678.0"
+            number = int(float(text))
+        except (TypeError, ValueError):
+            return None
+    return number if number >= 0 else None
+
+
+def _read_csv_text(path: Path) -> str:
+    """Read an exported CSV; Excel re-saves these as GBK on a Chinese Windows."""
+    try:
+        return path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="gbk")
+
+
+def parse_history_csv(text: str) -> tuple[list[dict], int]:
+    """Read back what ``export_history_csv`` wrote, as ``(rows, skipped)``.
+
+    Columns are matched by *name*, so extra columns, a different order, or a file
+    Excel re-saved all still work, and only the five essential ones must be present
+    (the export also writes ``volume`` and ``source``); without them this is not
+    that CSV and the import is refused. A bad *row* is skipped and counted instead
+    of aborting the batch, and an unrecognised ``source`` counts as skipped rather
+    than being assumed local — see ``_HISTORY_SOURCES``.
+
+    Each row comes back as a dict with ints for the timestamp and cents, ready for
+    ``Database.import_history_csv``: this project stores money as integer cents and
+    never re-derives it from a float at the storage boundary.
+    """
+    reader = csv.DictReader(io.StringIO(text))
+    header = [name.strip() for name in (reader.fieldnames or [])]
+    missing = [name for name in _HISTORY_CSV_REQUIRED if name not in header]
+    if missing:
+        raise ValueError(f"不是导出的历史 CSV：缺少列 {'、'.join(missing)}")
+    rows: list[dict] = []
+    skipped = 0
+    for raw in reader:
+        row = {(name or "").strip(): value for name, value in raw.items()}
+        appid = _as_int(row.get("appid"))
+        stamp = _as_int(row.get("utc_timestamp"))
+        cents = parse_price_cents(row.get("lowest_listing_price"))
+        name = str(row.get("market_hash_name") or "").strip()
+        currency = str(row.get("currency") or "").strip().upper()
+        source = str(row.get("source") or "local").strip().lower() or "local"
+        volume = str(row.get("volume") or "").strip() or None
+        if (not appid or stamp is None or cents is None or not name or not currency
+                or source not in _HISTORY_SOURCES):
+            skipped += 1
+            continue
+        rows.append({"appid": appid, "hash_name": name, "currency": currency,
+                     "recorded_at": stamp, "price_cents": cents, "volume": volume,
+                     "source": source})
+        if len(rows) > MAX_HISTORY_IMPORT_ROWS:
+            raise ValueError(f"CSV 行数超过上限 {MAX_HISTORY_IMPORT_ROWS}，请确认导入的是历史数据")
+    return rows, skipped
 
 
 class Database:
@@ -73,6 +146,7 @@ class Database:
                     created_at INTEGER NOT NULL,
                     last_checked_at INTEGER,
                     last_error TEXT,
+                    last_error_kind TEXT NOT NULL DEFAULT '',
                     UNIQUE(appid, hash_name)
                 );
                 CREATE TABLE IF NOT EXISTS snapshots (
@@ -111,6 +185,13 @@ class Database:
             if "currency" not in columns:
                 db.execute(
                     "ALTER TABLE official_prices ADD COLUMN currency TEXT NOT NULL DEFAULT ''")
+            # Same create-only-plus-guarded-ALTER upgrade path for items: the state
+            # column needs to tell 限流 (a rate limit: change the proxy) apart from
+            # 异常 (a network failure: wait for it to come back).
+            item_columns = {row["name"] for row in db.execute("PRAGMA table_info(items)")}
+            if "last_error_kind" not in item_columns:
+                db.execute(
+                    "ALTER TABLE items ADD COLUMN last_error_kind TEXT NOT NULL DEFAULT ''")
 
     def add_item(self, item: MarketItem, target_cents: int | None = None) -> int:
         with self.connection() as db:
@@ -186,9 +267,16 @@ class Database:
         with self.connection() as db:
             db.execute("UPDATE items SET image_url=? WHERE id=?", (url, item_id))
 
-    def set_error(self, item_id: int, message: str) -> None:
+    def set_error(self, item_id: int, message: str, kind: str = "") -> None:
+        """Record why an item failed, with an optional kind for the UI's state column.
+
+        ``kind="rate_limit"`` is a different situation from a network failure — the
+        remedy is a different proxy node, not a retry — so the watchlist shows 限流
+        rather than 异常 for it. Success clears both (see ``record_snapshot``).
+        """
         with self.connection() as db:
-            db.execute("UPDATE items SET last_error=? WHERE id=?", (message[:300], item_id))
+            db.execute("UPDATE items SET last_error=?,last_error_kind=? WHERE id=?",
+                       (message[:300], kind[:32], item_id))
 
     def record_snapshot(self, item_id: int, currency: str, price_cents: int,
                         volume: str = "", checked_at: int | None = None,
@@ -238,7 +326,7 @@ class Database:
                               DO UPDATE SET price_cents=excluded.price_cents,
                                             volume=excluded.volume""",
                            (item_id, currency, now, price_cents, volume))
-            db.execute("UPDATE items SET last_checked_at=?,last_error=NULL WHERE id=?",
+            db.execute("UPDATE items SET last_checked_at=?,last_error=NULL,last_error_kind='' WHERE id=?",
                        (now, item_id))
             target = item["target_cents"]
             inside_target = target is not None and price_cents <= target
@@ -435,3 +523,62 @@ class Database:
                     # (including rows already inserted) still commits.
                     skipped += 1
         return added, skipped
+
+    def import_history_csv(self, path: Path) -> dict:
+        """Merge a history CSV back in — the counterpart of ``export_history_csv``.
+
+        This is how a series moves to another machine or comes back after a wipe.
+        Three rules keep the import faithful:
+
+        * ``source`` routes the row: official points stay in ``official_prices`` and
+          local ones in ``snapshots``, so an import cannot turn a median *sale* into
+          a lowest *ask*.
+        * Items are matched by ``(appid, market_hash_name)``. An item this database
+          does not know is recreated **paused**: a file must never start polling
+          something by itself.
+        * Both inserts ignore a point that is already stored (their natural key), so
+          re-importing the same file adds nothing and counts never double.
+
+        Samples land exactly as written — the on-change/6-hour dedup belongs to
+        polling, not to a restore. Returns a summary the UI can report.
+        """
+        rows, skipped = parse_history_csv(_read_csv_text(path))
+        summary = {"rows": 0, "local": 0, "official": 0, "created": 0,
+                   "duplicate": 0, "skipped": skipped, "currencies": {}}
+        now = int(time.time())
+        with self.connection() as db:
+            known = {(row["appid"], row["hash_name"]): int(row["id"])
+                     for row in db.execute("SELECT id, appid, hash_name FROM items")}
+            for row in rows:
+                key = (row["appid"], row["hash_name"])
+                item_id = known.get(key)
+                if item_id is None:
+                    item_id = self._add_item(db, MarketItem(row["appid"], row["hash_name"],
+                                                            row["hash_name"]))
+                    db.execute("UPDATE items SET enabled=0 WHERE id=?", (item_id,))
+                    known[key] = item_id
+                    summary["created"] += 1
+                if row["source"] == "official":
+                    symbol = CURRENCIES.get(row["currency"], ("", "", ""))[2]
+                    cursor = db.execute("""
+                        INSERT INTO official_prices(item_id, recorded_at, price_cents,
+                                                    currency, currency_label, imported_at)
+                        VALUES(?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(item_id, recorded_at) DO NOTHING
+                    """, (item_id, row["recorded_at"], row["price_cents"], row["currency"],
+                          f"{symbol}…" if symbol else "", now))
+                else:
+                    cursor = db.execute("""
+                        INSERT INTO snapshots(item_id, currency, recorded_at, price_cents, volume)
+                        VALUES(?, ?, ?, ?, ?)
+                        ON CONFLICT(item_id, currency, recorded_at) DO NOTHING
+                    """, (item_id, row["currency"], row["recorded_at"], row["price_cents"],
+                          row["volume"]))
+                if cursor.rowcount:
+                    summary[row["source"]] += 1
+                    summary["rows"] += 1
+                    counts = summary["currencies"]
+                    counts[row["currency"]] = counts.get(row["currency"], 0) + 1
+                else:
+                    summary["duplicate"] += 1
+        return summary

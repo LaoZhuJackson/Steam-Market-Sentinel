@@ -24,8 +24,9 @@ from steam_market_sentinel.models import MarketItem
 from steam_market_sentinel.steam_api import SteamMarketClient
 from steam_market_sentinel.style import PALETTE, STYLE, apply_theme
 from steam_market_sentinel.ui import (
-    COL_CHECK, COL_LOW, COL_NAME, COL_REMOVE, ImportHistoryDialog, MainWindow,
-    SearchAddDialog, history_snippet, point_tooltip_text,
+    COL_CHECK, COL_LOW, COL_NAME, COL_REMOVE, COL_STATE, STATE_COLORS,
+    ImportHistoryDialog, MainWindow, SearchAddDialog, SettingsDialog, history_snippet,
+    point_tooltip_text,
 )
 
 
@@ -275,7 +276,8 @@ def test_image_bytes_reach_the_label_and_the_cache(monkeypatch, tmp_path):
     db = Database(tmp_path / "data.sqlite")
     item = db.add_item(MarketItem(730, "Revolution Case", "Revolution Case"), 900)
     db.set_item_image(item, host)
-    monkeypatch.setattr(ui_module, "_fetch_image_bytes", lambda _url: png)
+    # The second argument is the configured route to Steam (see Settings.proxy_argument).
+    monkeypatch.setattr(ui_module, "_fetch_image_bytes", lambda _url, _proxy="": png)
 
     app, window = _window(tmp_path, db)
     for _ in range(100):
@@ -453,7 +455,7 @@ def test_thumbnails_survive_a_restart(monkeypatch, tmp_path):
     db.set_item_image(item, host)
     calls = []
     monkeypatch.setattr(ui_module, "_fetch_image_bytes",
-                        lambda url: (calls.append(url), png)[1])
+                        lambda url, _proxy="": (calls.append(url), png)[1])
 
     app, first = _window(tmp_path, db)
     for _ in range(100):
@@ -520,6 +522,73 @@ def test_add_dialog_can_set_a_display_name():
     dialog.close()
 
 
+def test_importing_a_history_csv_restores_the_series(monkeypatch, tmp_path):
+    db = Database(tmp_path / "data.sqlite")
+    app, window = _window(tmp_path, db)
+    csv_path = tmp_path / "prices.csv"
+    csv_path.write_text(
+        "appid,market_hash_name,currency,utc_timestamp,lowest_listing_price,volume,source\n"
+        "730,Revolution Case,CNY,100,3.00,,local\n"
+        "730,Revolution Case,CNY,200,2.00,,official\n", encoding="utf-8-sig")
+    monkeypatch.setattr(ui_module.QFileDialog, "getOpenFileName",
+                        lambda *_args, **_kwargs: (str(csv_path), ""))
+
+    window.import_history()
+    item_id = window.table.item(0, COL_NAME).data(Qt.UserRole)
+    # 史低 is the merged minimum, so the imported official dip reaches the table...
+    assert "2.00" in window.table.item(_row_of(window, item_id), COL_LOW).text()
+    # ...and the item came back paused, so nothing is polled before the user looks.
+    assert window.table.item(_row_of(window, item_id), COL_STATE).text() == "暂停"
+    assert db.get_history(item_id, "CNY") == [(100, 300), (200, 200)]
+    window.close()
+
+
+def test_settings_dialog_carries_the_proxy_choice():
+    # A blocked direct route is the usual reason monitoring fails, so the route has
+    # to be editable — and "手动指定" is the only mode that uses the address box.
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(None, Settings())
+    assert not dialog.proxy_url.isEnabled()
+    assert dialog.chosen().proxy_argument() == ""  # 使用系统代理 by default
+
+    dialog.proxy_mode_combo.setCurrentIndex(2)  # 手动指定代理
+    app.processEvents()
+    assert dialog.proxy_url.isEnabled()
+    dialog.proxy_url.setText("http://127.0.0.1:7897")
+    assert dialog.chosen().proxy_argument() == "http://127.0.0.1:7897"
+    dialog.close()
+
+
+def test_quitting_hides_the_window_instead_of_waiting_on_the_poll(tmp_path):
+    """Regression: quit used to block the GUI thread for up to 60s on the poll."""
+    db = Database(tmp_path / "data.sqlite")
+    db.add_item(MarketItem(730, "Revolution Case", "Revolution Case"))
+    app, window = _window(tmp_path, db)
+
+    class SlowWorker:
+        """A poll blocked inside a request. Deliberately has no wait()."""
+
+        def __init__(self):
+            self.stopped = False
+            self.running = True
+
+        def isRunning(self):
+            return self.running
+
+        def stop(self):
+            self.stopped = True
+
+    slow = SlowWorker()
+    window.worker = slow
+    window.quit_app()
+    assert slow.stopped and window._quitting
+    assert not window.isVisible()  # the window goes away immediately
+    assert window._quit_timer.isActive()  # ...and we poll for the thread instead
+    slow.running = False
+    assert window._finish_quit() is True
+    window._quit_timer.stop()
+
+
 def test_add_dialog_needs_a_selection_then_accepts_a_pasted_link():
     app = QApplication.instance() or QApplication([])
     dialog = SearchAddDialog()
@@ -539,3 +608,19 @@ def test_add_dialog_needs_a_selection_then_accepts_a_pasted_link():
     assert dialog.results.rowCount() == 1
     assert dialog.results.item(0, 0).text() == "AK-47 | Redline"
     dialog.close()
+
+
+def test_the_state_column_tells_rate_limits_apart_from_failures():
+    def row(**overrides):
+        base = {"enabled": 1, "last_error": None, "last_error_kind": "", "current_cents": 100}
+        base.update(overrides)
+        return base
+
+    from steam_market_sentinel.ui import item_state
+
+    assert item_state(row()) == "监控中"
+    assert item_state(row(current_cents=None)) == "待检测"
+    assert item_state(row(last_error="连接被重置")) == "异常"
+    assert item_state(row(last_error="Steam 限流", last_error_kind="rate_limit")) == "限流"
+    assert item_state(row(enabled=0, last_error="x")) == "暂停"
+    assert PALETTE["warning"] in STATE_COLORS["限流"]

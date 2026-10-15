@@ -40,11 +40,12 @@ On the left, the filterable watchlist; on the right, the selected item's price t
 - **Compact PySide6 dark UI** — filterable watchlist table, item thumbnails, price chart, system tray.
 - **One input to add an item** — paste a market listing URL and it resolves instantly, or type a keyword and pick from the results. Both share a single input box, so there is no longer a "which search box do I fill in?" question.
 - **Cross-game search** — optionally scope by AppID (CS2 `730`, Dota 2 `570`, TF2 `440`, …), or use `0` to search every game.
-- **Batch polling** — items are polled one by one, with separate cycle-interval and per-item spacing; rate limits and network errors back off and retry, and one failing item never aborts the cycle.
+- **Batch polling** — items are polled one by one, with separate cycle-interval and per-item spacing (the gap carries a jitter that only ever lengthens it); network errors retry sooner and one failing item never aborts the cycle, while a **rate limit backs the whole cycle off** (10 minutes, doubling to an hour cap) and shows as 限流 in the list.
 - **Two alert rules** — ① notify once when `price <= target`, re-arming only after the price leaves the threshold; ② notify when the price strictly beats the lowest listing observed since tracking began (the first sample only establishes a baseline and does not alert).
 - **Multiple notification channels** — desktop tray popups, QQ Mail SMTP, and OneBot v11 private messages (e.g. via NapCat). They can be enabled together.
-- **Local history and export** — SQLite snapshots of the lowest sell listing; JSON watchlist import/export and UTF-8 BOM CSV history export, either of which can be limited to the **ticked items**.
+- **Local history, import and export** — SQLite snapshots of the lowest sell listing; JSON watchlist import/export and UTF-8 BOM CSV history import/export (the CSV pair moves or restores a series between machines); exports can be limited to the **ticked items**.
 - **Switchable quote currency** — CNY / USD / EUR, each kept as an independent series.
+- **A selectable network route** — system proxy / environment variables, direct, or an explicit local proxy (Clash, v2rayN, …). "My browser can open the market" does not mean a Python process can, so the route is a setting; failures now name the layer that broke (a cut route, a certificate, or the proxy itself).
 - **Official sales history you can import and keep** — Steam's **median sale price** curve is only served to a browser session, and the app never asks for or stores credentials. So there is an "导入官方历史…" (import) action: run one line in the item page, paste the result, and it is **stored for good and merged into that item's observed curve** (one line; the two are different quantities — see "Price definitions" below).
 - **Secrets stay in the OS keyring** — the QQ Mail authorization code and OneBot access token go through `keyring`, never into `settings.json`.
 
@@ -125,9 +126,13 @@ You can also edit the **display name**: Chinese is fine, it only affects the loc
 
 Open the item page with **View on Steam** inside the "导入官方历史…" dialog — the import flow requires opening that page in your browser anyway, so it belongs to the same step.
 
-Every row also has a **tick box**, next to **全选** / **清除全选** (select all / clear) above the list: **Export watchlist** and **Export history CSV** then cover **only the ticked items** (with nothing ticked they fall back to everything, and the status bar says so). Ticks survive the polling refresh.
+Every row also has a **tick box**, next to **全选** / **清除全选** (select all / clear) above the list: **Export watchlist** and **Export history** then cover **only the ticked items** (with nothing ticked they fall back to everything, and the status bar says so). Ticks survive the polling refresh.
 
 Settings additionally has a **global** switch, "**Notify when the price drops**": it notifies whenever this cycle's lowest price is below the previous local sample. It is independent of the two rules above and unaffected by the all-time low — after importing an official history it is usually more useful than "new all-time low".
+
+**Will a broken network spam me?** A failing item notifies once and again when it recovers, and both are *transitions*. An outage hits **every** item, so at most **one notice per 5 minutes** is sent for each kind; the rest only update the row state ("异常"). How many were held back is reported in the next notice that does go out ("same batch: 12 more items had the same problem"), so nothing is swallowed silently. Recovery works the same way: one outage costs at most two notices.
+
+**Closing the app**: the window disappears **immediately** and never hangs. If a request happens to be stuck on the network, the process finishes it in the background (usually under a second, and forcibly after 30 s at the very worst). That request counts as a cancellation: the item is not marked "异常" and no notice is sent. Settings and view state are saved before the window goes.
 
 **Why the curve barely seems to move**: a sample is stored only when the **price changes** or every **6 hours** (a heartbeat), so a stable price does not grow a new point every cycle — that is deliberate, to bound database size. **Last checked** updates on every successful poll, which is how you confirm monitoring is actually running, while **last sampled** only advances when a sample is really written. The two differing is normal.
 
@@ -138,6 +143,17 @@ The **time range** selector above the chart can show just the last 7 / 30 / 90 d
 The app **remembers the selected item** and reopens on the same view (imported official history lives in the local database, so it is never lost). There is one price chart: local samples and any imported official history are shown merged, not as two switchable modes.
 
 The filter box above the watchlist narrows it by name; **Refresh now** starts the next cycle as soon as the current one finishes.
+
+### Importing / exporting history (CSV)
+
+**Export history** writes the current currency's series (local samples plus any imported official median-sale points) as a UTF-8 BOM CSV with a `source` column; **Import history** is its exact reverse, for **moving to another machine or restoring a backup**:
+
+- The **`source` column decides the destination table**: `official` rows go back to the imported series and the rest to local samples, so an import can never turn a median *sale* into a lowest *ask*. An unrecognised `source` is skipped and counted, never guessed.
+- An item already in the watchlist (matched by AppID + `market_hash_name`) gets the rows merged into its history; an unknown one is **recreated paused**, because importing a file must not start polling items you have not looked at. Enable them in the list once you are happy.
+- **Re-importing the same file adds nothing** — existing points keep their stored value.
+- Imports are always the whole file; only exports honour the tick boxes.
+- Rows in another currency are stored normally (currencies are independent series) and the status bar says how many, so you know to switch currency to see them.
+- Files re-saved by Excel (columns reordered, GBK encoding, integers written as `123.0`) still import, but the required columns (`appid`, `market_hash_name`, `currency`, `utc_timestamp`, `lowest_listing_price`) must all be there.
 
 ### Importing the official sales history
 
@@ -204,7 +220,8 @@ Tray + QQ Mail is the recommended combination.
 |---|---|---|
 | Quote currency | CNY | Queries the lowest sell listing in that currency; each currency is stored separately |
 | Cycle interval | 15 minutes | How long to wait between cycles over all enabled items; 1–1440 minutes, too short invites rate limiting |
-| Per-item gap | 6 seconds | Delay between individual item requests; 3–120 seconds |
+| Per-item gap | 6 seconds | Delay between individual item requests; 3–120 seconds . The effective gap adds a random 0–25% on top (never less), so the setting stays a floor you can reason about |
+| **Network proxy** | System proxy | See "Proxies and accelerators" below: **system proxy / environment variables**, **direct**, or **custom** (e.g. `http://127.0.0.1:7897`) |
 | Start monitoring on launch | On | Begins working in a background thread |
 | Minimize to tray on close | On | The process only exits via "Quit" in the tray menu |
 | Show desktop tray notifications | On | Needs a desktop environment with notification support |
@@ -215,6 +232,79 @@ Tray + QQ Mail is the recommended combination.
 **Batch monitoring is not a real-time feed**: watching 100 items with a 6-second gap means one cycle alone takes at least ~10 minutes before network and rate-limit time. The cycle interval is the wait **between** cycles, not a per-item refresh guarantee.
 
 **Monitoring recovers by itself**: if anything failed in a cycle, the next one comes **2 minutes** later instead of waiting the full interval — so reconnecting or switching on your proxy needs no button press. The first successful poll clears the 异常 state back to 监控中 and sends one "monitoring recovered" notice, if notifications are enabled.
+
+### Rate limiting (HTTP 429)
+
+**Changing the polling cadence does not fix a rate limit, because Steam limits the *market* per exit IP.**
+Measured on one machine, one proxy IP, 13 back-to-back requests:
+
+| Target | Result |
+|---|---|
+| `steamcommunity.com/market/priceoverview` (quotes) | **429 × 10/10** |
+| `steamcommunity.com/market/search/render` (search) | **429 × 3/3** |
+| `steamcommunity.com/market/` (market HTML) | **429** |
+| `steamcommunity.com/my/` (same host, not the market) | **200** |
+| `store.steampowered.com` | **200** |
+| `api.steampowered.com` | **200** |
+
+So even the *first* request of a cold batch is refused (as is the market's own HTML) while everything else on
+that IP works. That is an IP-level limit, not a fingerprintable cadence:
+
+- **polling faster makes it worse** (3 retries × 20 items = 60 requests per cycle);
+- **jitter or random slots** are a courtesy, not a cure, for an IP that is already limited;
+- **changing the exit IP is what works** — switch proxy nodes (shared nodes are the ones other people have
+  already burned; prefer a quieter or self-hosted one);
+- then keep the volume minimal: 20 items / 20 minutes ≈ **1 request per minute** is already gentle.
+
+The app now handles this by itself:
+
+- a 429 **stops the cycle immediately** (no walking the other 19 items — that is what keeps a limit alive)
+  and is not retried in place; only a *short* `Retry-After` (≤20 s) is waited out for one retry;
+- the whole cycle then backs off **10 → 20 → 40 → 60 minutes** (±10% jitter so instances behind one IP do not
+  retry in lockstep), and the status bar says how long;
+- the row state becomes **限流** (amber) rather than 异常, because the remedies differ: change the node vs. wait
+  for the network. A successful poll clears it back to 监控中.
+
+### Proxies and accelerators
+
+**A browser being able to open the Steam market does not mean this app can.** They do not take the
+same path:
+
+- the browser may use an extension or its own proxy setting, or an accelerator may cover only the
+  **browser** process;
+- this app uses Python's `requests`, which **cannot read a PAC script** and is not covered by an
+  accelerator that only accelerates a game or the browser;
+- if the system proxy (Windows "Internet Options → LAN settings") is switched off, the app is
+  effectively direct — and **turning a VPN off frequently turns the system proxy off with it**.
+
+**How to tell**: if the status bar or the item tooltip says 「**连接被重置（TLS 握手被中断）：直连多半被阻断**」
+(a reset during the TLS handshake), this is the problem. 「TLS 证书校验失败」 instead means the proxy's
+or accelerator's certificate is not trusted.
+
+**What to do**: 设置 → 常规 → **网络代理** → **手动指定**, then enter your local proxy:
+
+| Your tool | Value |
+|---|---|
+| Clash Verge / Mihomo | `http://127.0.0.1:7897` (the default mixed port) |
+| v2rayN / sing-box, etc. | that tool's HTTP inbound port, e.g. `http://127.0.0.1:10809` |
+| SOCKS-only proxy | `socks5h://127.0.0.1:1080` (needs `pip install "requests[socks]"`) |
+| Game accelerators (雷神/UU, …) | they usually accelerate a chosen game or the browser only and expose **no port to point at**. Use one of the rows above, or add this program (`python.exe` in a source checkout, `SteamMarketSentinel.exe` when packaged) to the accelerator's list |
+
+Saving restarts monitoring on the new route immediately — no relaunch. As a quick stopgap you can set
+the environment variable before launching (the default "system proxy / environment variables" mode
+reads it):
+
+```bash
+# PowerShell
+$env:HTTPS_PROXY="http://127.0.0.1:7897"; python main.py
+# cmd
+set HTTPS_PROXY=http://127.0.0.1:7897 && python main.py
+```
+
+Confirmed on a real machine: `store.steampowered.com` and the image CDN answered directly while
+`steamcommunity.com` had its TLS handshake **reset** (`WinError 10054`), and a local proxy restored it
+at once. Only Steam requests use this route; unrelated traffic (e.g. a local OneBot endpoint) is
+untouched.
 
 ## Price definitions, privacy and data
 
@@ -241,6 +331,27 @@ Set `SMS_DATA_DIR` to a writable path to override the directory, which is handy 
 The database stores no passwords or authorization codes, and the JSON watchlist export contains no credentials. **Removing an item also deletes its local history** — export a backup first.
 
 ## FAQ
+
+<details>
+<summary>Monitoring stays 异常 and the status bar reports a network failure. What now?</summary>
+
+Read what the message names:
+
+- **「连接被重置（TLS 握手被中断）：直连多半被阻断」** — the app is going direct and that route is
+  cut. A working browser proves nothing: it may use an extension proxy, or the accelerator may cover
+  only the browser. Set 设置 → 常规 → **网络代理** to **手动指定** and enter your local proxy
+  (`http://127.0.0.1:7897` for a default Clash install). It takes effect on save. See
+  "Proxies and accelerators" above.
+- **「TLS 证书校验失败」** — the proxy or accelerator intercepts TLS with a root certificate the OS
+  does not trust.
+- **「代理连接失败」** — the address is wrong or the proxy is not running.
+- **The list shows 限流 (amber), or the status bar reports 429** — Steam is limiting the exit IP (common with
+  shared nodes; the market is limited while the store and the official API on the same IP still answer).
+  **Switching proxy nodes usually fixes it at once**; the app already backs the cycle off by itself. See
+  "Rate limiting (HTTP 429)" above.
+- Also check that the item's "Enable monitoring" box is still ticked — that shows 暂停, not 异常.
+
+</details>
 
 <details>
 <summary>Does it need a Steam account, password or API key?</summary>

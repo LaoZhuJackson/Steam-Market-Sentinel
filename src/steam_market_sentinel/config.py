@@ -16,6 +16,20 @@ CHART_RANGES = (
 )
 _CHART_RANGE_DAYS = {days for _label, days in CHART_RANGES}
 
+# How this process reaches Steam. "system" leaves requests' own behaviour alone (an
+# enabled Windows proxy first, then HTTP(S)_PROXY); "direct" ignores both. This is a
+# setting rather than automatic detection because a browser being able to open the
+# market says nothing about a Python process: game accelerators frequently cover only
+# the browser or the game, and `requests` cannot use a PAC script at all — so the
+# user has to be able to point the app at a local proxy port themselves.
+PROXY_MODES = (
+    ("system", "使用系统代理 / 环境变量"),
+    ("direct", "直连（不使用代理）"),
+    ("custom", "手动指定代理"),
+)
+_PROXY_MODE_VALUES = {mode for mode, _label in PROXY_MODES}
+_PROXY_SCHEMES = ("http://", "https://", "socks5://", "socks5h://", "socks4://", "socks4a://")
+
 
 def data_directory() -> Path:
     forced = os.environ.get("SMS_DATA_DIR")
@@ -57,6 +71,22 @@ class Settings:
     # How much of the price history the chart shows. Narrow ranges keep recent small
     # moves readable when an old spike would otherwise flatten the whole curve.
     chart_range_days: int = 0
+    # Network route to Steam. See PROXY_MODES: a blocked direct route is the most
+    # common cause of "监控异常" here, and the app cannot detect it for the user.
+    proxy_mode: str = "system"
+    proxy_url: str = ""
+
+    def proxy_argument(self) -> str:
+        """The route to hand to the HTTP layer: ``""`` (system/env), ``direct``, or a URL.
+
+        A "custom" mode with nothing typed in it falls back to the system setting
+        rather than to a broken proxy.
+        """
+        if self.proxy_mode == "direct":
+            return "direct"
+        if self.proxy_mode == "custom" and self.proxy_url.strip():
+            return self.proxy_url.strip()
+        return ""
 
     @classmethod
     def load(cls, path: Path) -> "Settings":
@@ -76,6 +106,11 @@ class Settings:
                                     if isinstance(config.selected_item, int) else None)
             config.chart_range_days = (config.chart_range_days
                                        if config.chart_range_days in _CHART_RANGE_DAYS else 0)
+            if config.proxy_mode not in _PROXY_MODE_VALUES:
+                config.proxy_mode = "system"
+            config.proxy_url = str(config.proxy_url or "").strip()
+            if config.proxy_url and not config.proxy_url.lower().startswith(_PROXY_SCHEMES):
+                config.proxy_url = ""  # an unusable address must not break every request
             return config
         except (ValueError, TypeError, OSError, AttributeError):
             return cls()

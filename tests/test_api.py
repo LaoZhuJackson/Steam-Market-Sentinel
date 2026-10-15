@@ -1,9 +1,14 @@
 import json
+import ssl
+import threading
+import time
 
 import pytest
+import requests
 
 from steam_market_sentinel.steam_api import (
-    SteamAPIError, SteamMarketClient, parse_icon_url, parse_imported_history,
+    SteamAPIError, SteamMarketClient, SteamRateLimited, apply_proxy, failure_message,
+    parse_icon_url, parse_imported_history,
 )
 
 
@@ -178,3 +183,107 @@ def test_imported_history_handles_a_real_captured_payload():
 def test_imported_history_rejects_unusable_input(bad):
     with pytest.raises(ValueError):
         parse_imported_history(bad)
+
+
+def test_a_cancelled_client_stops_before_making_any_request():
+    # Quitting must not wait out retries: with the monitor's stop event already set,
+    # no request is started and no backoff is slept through.
+    cancel = threading.Event()
+    client = SteamMarketClient(session=FakeSession({"success": True}), cancel=cancel)
+    cancel.set()
+    started = time.monotonic()
+    with pytest.raises(SteamAPIError, match="取消"):
+        client.price(730, "Revolution Case", "CNY")
+    assert client.session.calls == []
+    with pytest.raises(SteamAPIError, match="取消"):
+        client._sleep(30)  # the exact delay does not matter: wait() returns at once
+    assert time.monotonic() - started < 1
+
+
+def test_proxy_modes_reach_the_session():
+    # "" keeps requests' own behaviour, "direct" turns it off, a URL overrides it.
+    system = requests.Session()
+    apply_proxy(system, "")
+    assert system.trust_env is True and not system.proxies
+
+    direct = SteamMarketClient(session=requests.Session(), proxy="direct")
+    assert direct.session.trust_env is False and direct.session.proxies == {}
+
+    custom = SteamMarketClient(session=requests.Session(), proxy="http://127.0.0.1:7897")
+    assert custom.session.proxies["http"] == "http://127.0.0.1:7897"
+    assert custom.session.proxies["https"] == "http://127.0.0.1:7897"
+
+
+def test_failure_message_names_the_layer_that_failed():
+    # A blocked direct route resets the TLS handshake. "网络请求失败（ConnectionError）"
+    # left the user with nothing to act on, which is what this mapping fixes.
+    reset = requests.exceptions.ConnectionError("('Connection aborted.', ConnectionResetError)")
+    reset.__cause__ = ConnectionResetError(10054, "远程主机强迫关闭了一个现有的连接。")
+    message = failure_message(reset)
+    assert "连接被重置" in message and "代理" in message
+
+    # requests also reports a dropped handshake as SSLError — that is a cut route,
+    # not a certificate problem, so the chain has to be inspected before the class.
+    dropped = requests.exceptions.SSLError("EOF occurred in violation of protocol")
+    dropped.__context__ = ssl.SSLEOFError("EOF occurred in violation of protocol")
+    assert "连接被重置" in failure_message(dropped)
+
+    assert "代理连接失败" in failure_message(
+        requests.exceptions.ProxyError("cannot connect to proxy"))
+    assert "TLS 证书" in failure_message(requests.exceptions.SSLError("bad certificate"))
+    assert "超时" in failure_message(requests.exceptions.ConnectTimeout("timed out"))
+    assert "代理地址无效" in failure_message(requests.exceptions.InvalidSchema("no scheme"))
+    # requests says this when socks:// is used without PySocks; the fix is one pip line.
+    assert "requests[socks]" in failure_message(
+        requests.exceptions.InvalidSchema("Missing dependencies for SOCKS support."))
+    # Anything unmapped still names its own class, rather than claiming a cause.
+    assert failure_message(requests.exceptions.TooManyRedirects("loop")) == \
+        "网络请求失败（TooManyRedirects）"
+
+
+class RateLimitSession:
+    """Answers 429 (with an optional Retry-After) a few times, then the result."""
+
+    def __init__(self, limit=1, retry_after="", result=None):
+        self.headers = {}
+        self.calls = 0
+        self.limit = limit
+        self.retry_after = retry_after
+        self.result = result or {"success": True, "lowest_price": "¥1.00", "volume": "1"}
+
+    def get(self, url, params, timeout):
+        self.calls += 1
+        if self.calls <= self.limit:
+            response = ErrorResponse(429)
+            if self.retry_after:
+                response.headers["Retry-After"] = self.retry_after
+            return response
+        return Response(self.result)
+
+
+def test_rate_limit_is_not_hammered_with_retries():
+    # The market's 429 is per exit IP and lasts minutes: three attempts per item times
+    # twenty items is sixty requests, which is what keeps the limit alive.
+    session = RateLimitSession(limit=99)
+    client = SteamMarketClient(session=session, retries=2)
+    with pytest.raises(SteamRateLimited) as caught:
+        client.price(730, "Revolution Case", "CNY")
+    assert session.calls == 1
+    assert caught.value.status == 429
+    assert caught.value.suggested_wait is None
+    assert isinstance(caught.value, SteamAPIError)  # existing callers keep working
+
+    long_wait = RateLimitSession(limit=99, retry_after="300")
+    with pytest.raises(SteamRateLimited) as caught:
+        SteamMarketClient(session=long_wait, retries=2).price(730, "Revolution Case", "CNY")
+    assert long_wait.calls == 1  # a 5-minute wait is the caller's business, not ours
+    assert caught.value.suggested_wait == 300
+
+
+def test_a_short_retry_after_is_honoured_with_one_retry():
+    # Steam telling us "1 second" is worth waiting out; a limitation it just told us
+    # about is not the same as a wedged socket.
+    session = RateLimitSession(limit=1, retry_after="1")
+    price, _volume = SteamMarketClient(session=session, retries=2).price(
+        730, "Revolution Case", "CNY")
+    assert (session.calls, price) == (2, 100)

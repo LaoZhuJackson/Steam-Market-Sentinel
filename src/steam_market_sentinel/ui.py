@@ -4,8 +4,10 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime
 import hashlib
+import os
 import sqlite3
 from pathlib import Path
+import time
 import webbrowser
 
 import requests
@@ -23,17 +25,22 @@ from PySide6.QtWidgets import (
 from PySide6.QtCharts import QDateTimeAxis, QValueAxis
 
 from .alerts import SecretStore, render_alert, send_test
-from .config import CHART_RANGES, Settings
+from .config import CHART_RANGES, PROXY_MODES, Settings
 from .database import Database
 from .models import Alert, CURRENCIES, MarketItem, cents_text, from_amount, listing_url, parse_listing_url
 from .monitor import MonitorWorker
-from .steam_api import SteamMarketClient, parse_imported_history
+from .steam_api import SteamMarketClient, apply_proxy, parse_imported_history
 from .style import PALETTE
 
 # Marker dots turn a dense series into a blob — an imported official history is
 # routinely 300+ points. But a *sparse* series needs them: a single point draws no
 # line at all, so it would render invisibly. Hover works either way.
 SPARSE_SERIES_MARKERS = 40
+
+# How long quitting waits for the poll/image threads after the window has gone.
+# Normally they finish in well under a second; the bound only matters when a socket
+# that was already in flight never comes back.
+QUIT_GRACE_SECONDS = 30
 
 # Watchlist columns: a check box, the item, its three prices, its state, and a
 # per-row remove button. Named so the many places that touch a row index cannot
@@ -44,9 +51,24 @@ SPARSE_SERIES_MARKERS = 40
 STATE_COLORS = {
     "监控中": PALETTE["accent"],
     "异常": PALETTE["danger"],
+    "限流": PALETTE["warning"],
     "暂停": PALETTE["text_disabled"],
     "待检测": PALETTE["text_muted"],
 }
+
+
+def item_state(item: dict) -> str:
+    """The 状态 cell for a watchlist row.
+
+    限流 is kept apart from 异常 on purpose: the remedies differ (a rate limit means
+    changing the proxy node, not waiting for the network to come back), and seeing
+    twenty red rows when nothing is broken reads as a broken app.
+    """
+    if not item["enabled"]:
+        return "暂停"
+    if item["last_error"]:
+        return "限流" if item.get("last_error_kind") == "rate_limit" else "异常"
+    return "监控中" if item["current_cents"] is not None else "待检测"
 
 # Official sales history cannot be fetched by this app (Steam serves it only to a
 # browser session, and we never touch cookies). So the user fetches it once from
@@ -86,11 +108,18 @@ def history_snippet(currency: str) -> str:
                                     f"&currency={currency_id}&country={country}")
 
 
-def _fetch_image_bytes(url: str) -> bytes:
-    """Fetch an image with `requests` — never Qt's network stack (see _run_image_task)."""
-    response = requests.get(url, timeout=(8, 20))
-    response.raise_for_status()
-    return response.content
+def _fetch_image_bytes(url: str, proxy: str = "") -> bytes:
+    """Fetch an image with `requests` — never Qt's network stack (see _run_image_task).
+
+    The configured route applies here too: the image CDN answers directly on some
+    networks that block the market, but going through a user's proxy is what they
+    expect from "使用代理", and a proxy with its own rules will route it correctly.
+    """
+    with requests.Session() as session:
+        apply_proxy(session, proxy)
+        response = session.get(url, timeout=(8, 20))
+        response.raise_for_status()
+        return response.content
 
 
 def point_tooltip_text(symbol: str, stamp: int, price: float) -> str:
@@ -155,9 +184,10 @@ class SearchAddDialog(QDialog):
     「添加监控」按钮保持禁用，避免出现两个含义不清的输入框。
     """
 
-    def __init__(self, parent=None, currency="CNY"):
+    def __init__(self, parent=None, currency="CNY", proxy=""):
         super().__init__(parent)
         self.currency = currency
+        self.proxy = proxy  # 搜索也走设置里的代理，否则这里会一直报网络错误
         self.setWindowTitle("添加 Steam 监控商品")
         self.resize(760, 600)
         self.found: list[MarketItem] = []
@@ -264,7 +294,10 @@ class SearchAddDialog(QDialog):
         self.info.setText("正在查询 Steam 市场…")
         filter_appid = self.filter_app.value()
         currency = self.currency
-        self.task = BackgroundCall(lambda: SteamMarketClient(retries=1).search(
+        # Bound outside the lambda: this runs on a worker thread after the dialog
+        # may already be gone.
+        proxy = self.proxy
+        self.task = BackgroundCall(lambda: SteamMarketClient(retries=1, proxy=proxy).search(
             text, filter_appid, limit=30, currency=currency))
         self.task.succeeded.connect(self.show_results)
         self.task.failed.connect(self.search_failed)
@@ -380,6 +413,17 @@ class SettingsDialog(QDialog):
         self.gap.setRange(3, 120)
         self.gap.setSuffix(" 秒")
         self.gap.setValue(original.request_gap_seconds)
+        self.proxy_mode_combo = QComboBox()
+        self.proxy_mode_combo.addItems([label for _mode, label in PROXY_MODES])
+        self.proxy_mode_combo.setCurrentIndex(
+            [mode for mode, _label in PROXY_MODES].index(original.proxy_mode))
+        self.proxy_mode_combo.setToolTip("「使用系统代理」遵循 Windows 代理设置与 HTTP(S)_PROXY；"
+                                         "Windows 里代理被关掉（例如只用加速器）时，本程序就等于直连")
+        self.proxy_url = QLineEdit(original.proxy_url)
+        self.proxy_url.setPlaceholderText("http://127.0.0.1:7897（Clash/加速器的本地端口）")
+        self.proxy_url.setEnabled(original.proxy_mode == "custom")
+        self.proxy_mode_combo.currentIndexChanged.connect(
+            lambda index: self.proxy_url.setEnabled(PROXY_MODES[index][0] == "custom"))
         self.auto = QCheckBox("启动程序时自动开始监控")
         self.auto.setChecked(original.auto_start)
         self.tray_checkbox = QCheckBox("关闭窗口时隐藏到系统托盘")
@@ -397,13 +441,18 @@ class SettingsDialog(QDialog):
         gf.addRow("报价币种", self.currency)
         gf.addRow("每轮检查间隔", self.interval)
         gf.addRow("每件商品请求间隔", self.gap)
+        gf.addRow("网络代理", self.proxy_mode_combo)
+        gf.addRow("", self.proxy_url)
         gf.addRow(self.auto)
         gf.addRow(self.tray_checkbox)
         gf.addRow(self.desktop)
         gf.addRow(self.drop_alert)
         gf.addRow(self.error_alert)
         general_note = QLabel("建议轮询间隔 ≥ 15 分钟，避免 Steam 限流。\n"
-                              "切换币种会分开保存趋势与史低，目标价格需按新币种重新调整。")
+                              "切换币种会分开保存趋势与史低，目标价格需按新币种重新调整。\n"
+                              "「网络代理」：浏览器能打开市场不代表本程序能 —— 加速器往往只加速浏览器，"
+                              "而本程序无法读取 PAC 脚本；若监控一直报「连接被重置」，"
+                              "请填写代理地址（例如 Clash 的 http://127.0.0.1:7897）。")
         general_note.setWordWrap(True)
         general_note.setObjectName("hint")
         gf.addRow(general_note)
@@ -480,6 +529,8 @@ class SettingsDialog(QDialog):
             currency=self.currency.currentText(),
             interval_seconds=self.interval.value() * 60,
             request_gap_seconds=self.gap.value(),
+            proxy_mode=PROXY_MODES[self.proxy_mode_combo.currentIndex()][0],
+            proxy_url=self.proxy_url.text().strip(),
             auto_start=self.auto.isChecked(),
             minimize_to_tray=self.tray_checkbox.isChecked(),
             desktop_enabled=self.desktop.isChecked(),
@@ -644,6 +695,8 @@ class MainWindow(QMainWindow):
         self._rule_timer.setInterval(400)
         self._rule_timer.timeout.connect(self.save_rule)
         self._quitting = False
+        self._quit_deadline = 0.0
+        self._quit_timer: QTimer | None = None
         self.current_item_id: int | None = None
         self.setWindowIcon(app_icon())
         self.setWindowTitle("Steam Market Sentinel · Steam 市场价格哨兵")
@@ -740,10 +793,16 @@ class MainWindow(QMainWindow):
         import_btn.clicked.connect(self.import_watchlist)
         export_btn = button("导出清单")
         export_btn.clicked.connect(self.export_watchlist)
-        csv_btn = button("导出历史 CSV")
+        import_csv_btn = button("导入历史")
+        import_csv_btn.setToolTip("导入「导出历史」生成的 CSV（本地采样 + 官方成交中位价），"
+                                  "用于迁移或恢复；重复导入不会翻倍")
+        import_csv_btn.clicked.connect(self.import_history)
+        csv_btn = button("导出历史")
+        csv_btn.setToolTip("导出当前币种的历史（CSV，带 source 列区分本地采样与官方成交中位价）")
         csv_btn.clicked.connect(self.export_history)
         actions.addWidget(import_btn)
         actions.addWidget(export_btn)
+        actions.addWidget(import_csv_btn)
         actions.addWidget(csv_btn)
         lv.addLayout(actions)
         splitter.addWidget(left)
@@ -765,6 +824,11 @@ class MainWindow(QMainWindow):
         self.item_title.setWordWrap(True)
         self.item_game = QLabel("点击左侧商品查看详情")
         self.item_game.setObjectName("subtle")
+        # Wrap it: a non-wrapping label reports its full text width as the panel's
+        # minimum, and a long English game name ("Steam Community Market") then made
+        # the panel wider than its viewport — which clipped the right-hand end of the
+        # chart header at the minimum window size.
+        self.item_game.setWordWrap(True)
         self.item_last = QLabel("")
         self.item_last.setObjectName("subtle")
         self.item_last.setWordWrap(True)  # the failure text is long
@@ -818,6 +882,10 @@ class MainWindow(QMainWindow):
         # window is shorter than this. Most of the growth comes from the stretch
         # below, so a taller window gives the chart more room automatically.
         self.chart.setMinimumHeight(260)
+        # A real width floor: left to itself the chart would happily shrink to a few
+        # dozen pixels (QChartView reports a tiny minimumSizeHint) rather than stay
+        # readable.
+        self.chart.setMinimumWidth(340)
         self.chart.setMouseTracking(True)  # 让 QLineSeries.hovered 能触发点提示
         rv.addWidget(self.chart, 1)
         rules = QFrame()
@@ -853,12 +921,15 @@ class MainWindow(QMainWindow):
         # The detail panel needs more vertical room than a short window can give
         # (the chart alone has a real minimum), so scroll it rather than letting
         # Qt squeeze or clip the widgets — which is what previously made the chart
-        # look cramped on small windows.
+        # look cramped on small windows. The horizontal bar stays "as needed" as a
+        # fallback: when something wide makes the panel wider than its viewport, the
+        # right-hand end (the chart header's 导入官方历史… button) must stay
+        # reachable — with the bar off it was simply clipped away.
         scroller = QScrollArea()
         scroller.setWidget(right)
         scroller.setWidgetResizable(True)
         scroller.setFrameShape(QFrame.NoFrame)
-        scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         splitter.addWidget(scroller)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 4)
@@ -940,8 +1011,7 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(len(records))
         keep_row = None
         for r, item in enumerate(records):
-            state = "暂停" if not item["enabled"] else (
-                "异常" if item["last_error"] else ("监控中" if item["current_cents"] is not None else "待检测"))
+            state = item_state(item)
             self.table.setItem(r, COL_CHECK, self._check_cell(item["id"]))
             values = (item["display_name"],
                       cents_text(item["current_cents"], self.settings.currency),
@@ -958,7 +1028,7 @@ class MainWindow(QMainWindow):
                     cell.setToolTip(f"{item['appid']} · {item['hash_name']}")
                 if column == COL_STATE:
                     cell.setForeground(QColor(STATE_COLORS.get(state, PALETTE["text_muted"])))
-                    if state == "异常":
+                    if state in ("异常", "限流"):
                         cell.setToolTip(item["last_error"] or "")
                 self.table.setItem(r, column, cell)
             self.table.setCellWidget(r, COL_REMOVE, self._remove_button(item["id"]))
@@ -1122,7 +1192,9 @@ class MainWindow(QMainWindow):
             return
         self._thumb_tried.add(item_id)
         self._run_image_task(
-            lambda: SteamMarketClient(retries=0).icon_url(item["appid"], item["hash_name"]),
+            lambda: SteamMarketClient(retries=0,
+                                      proxy=self.settings.proxy_argument()).icon_url(
+                item["appid"], item["hash_name"]),
             lambda url: self.on_thumbnail(item_id, url))
 
     def on_thumbnail(self, item_id: int, url: str):
@@ -1181,7 +1253,7 @@ class MainWindow(QMainWindow):
         if address in self._image_failed:  # do not hammer a URL that already failed
             return
         self._run_image_task(
-            lambda: _fetch_image_bytes(address),
+            lambda: _fetch_image_bytes(address, self.settings.proxy_argument()),
             lambda data: self.on_image_bytes(address, item_id, data),
             lambda _error: self._image_failed.add(address))
 
@@ -1361,7 +1433,8 @@ class MainWindow(QMainWindow):
         self.log(f"已导入 {count} 个官方成交历史数据点，已并入观测序列：{item['display_name']}")
 
     def add_item(self):
-        dialog = SearchAddDialog(self, self.settings.currency)
+        dialog = SearchAddDialog(self, self.settings.currency,
+                                 self.settings.proxy_argument())
         if dialog.exec() != QDialog.Accepted:
             return
         try:
@@ -1558,6 +1631,39 @@ class MainWindow(QMainWindow):
         scope = "已勾选的商品" if ids else "全部商品"
         self.log(f"CSV 已保存：{scope}、当前币种（source 列区分本地采样与官方成交中位价）")
 
+    def import_history(self):
+        """The reverse of export_history: merge an exported CSV back in."""
+        filename, _ = QFileDialog.getOpenFileName(self, "导入历史数据", "", "CSV (*.csv)")
+        if not filename:
+            return
+        try:
+            summary = self.db.import_history_csv(Path(filename))
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "导入失败", str(exc))
+            return
+        parts = [f"已导入 {summary['rows']} 行历史"
+                 f"（本地 {summary['local']} / 官方 {summary['official']}）"]
+        if summary["created"]:
+            # Created paused on purpose: importing a file must not start polling
+            # items the user has not looked at yet.
+            parts.append(f"新建 {summary['created']} 件商品"
+                         "（已置为「暂停」，确认后可在清单里启用）")
+        if summary["skipped"]:
+            parts.append(f"跳过 {summary['skipped']} 行无法识别的数据")
+        if not summary["rows"]:
+            parts.append("（重复导入不会重复计数）" if summary["duplicate"] else "文件里没有数据行")
+        others = {code: count for code, count in summary["currencies"].items()
+                  if code != self.settings.currency}
+        if others:
+            shown = "、".join(f"{code} {count} 行" for code, count in sorted(others.items()))
+            parts.append(f"其中 {shown} 属于其他币种，切换到该币种后可查看")
+        if summary["rows"] or summary["created"]:
+            # 史低 is the merged minimum, so an import changes values the chart alone
+            # would not update — same reason import_official_history refreshes both.
+            self._chart_key = None
+            self.refresh_table()
+        self.log("；".join(parts))
+
     def closeEvent(self, event):
         if not self._quitting and self.settings.minimize_to_tray and self.tray:
             event.ignore()
@@ -1569,17 +1675,42 @@ class MainWindow(QMainWindow):
             event.accept()
 
     def quit_app(self):
+        if self._quitting:  # the tray action and the window close can both arrive
+            return
         self._quitting = True
-        if self.worker and self.worker.isRunning():
-            self.worker.stop()
-            self.worker.wait(60000)
-        for task in list(self._image_tasks):
-            if task.isRunning():
-                task.wait(5000)
         if self.tray:
             self.tray.hide()
         try:
             self.settings.save(self.settings_path)  # remember the view state
         except OSError:
             pass
-        QApplication.instance().quit()
+        # Hide *before* waiting. This used to wait for the poll thread on the GUI
+        # thread — up to 60s — while the poll was blocked inside a Steam request that
+        # only returns when its own socket times out, which is what made closing the
+        # app look like a hang. The window is gone immediately now; the process
+        # follows as soon as the thread is done.
+        self.hide()
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+        self._quit_deadline = time.monotonic() + QUIT_GRACE_SECONDS
+        if self._finish_quit():
+            return
+        self._quit_timer = QTimer(self)
+        self._quit_timer.setInterval(100)
+        self._quit_timer.timeout.connect(self._finish_quit)
+        self._quit_timer.start()
+
+    def _finish_quit(self) -> bool:
+        """Leave once the background threads are done, or give up after the grace period."""
+        if not (self.worker and self.worker.isRunning()) \
+                and not any(task.isRunning() for task in self._image_tasks):
+            QApplication.instance().quit()
+            return True
+        if time.monotonic() >= self._quit_deadline:
+            # os._exit, not quit(): Qt aborts the process when a QThread that is
+            # still running gets torn down at interpreter exit (verified: exit code
+            # 127, no clean shutdown). By this point the only thing left is a socket
+            # that never came back — every sample is committed per call and the
+            # settings above are already saved.
+            os._exit(0)
+        return False
